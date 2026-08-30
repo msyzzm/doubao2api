@@ -47,6 +47,11 @@
     - [POST /v1/video/generations](#post-v1videogenerations)
       - [无水印视频](#无水印视频)
       - [额度耗尽自动换号](#额度耗尽自动换号)
+    - [POST /v1/videos](#post-v1videos)
+      - [GET /v1/videos/{video_id}](#get-v1videosvideo_id)
+      - [GET /v1/videos/{video_id}/content](#get-v1videosvideo_idcontent)
+      - [GET /v1/videos](#get-v1videos)
+      - [DELETE /v1/videos/{video_id}](#delete-v1videosvideo_id)
     - [POST /v1/audio/generations](#post-v1audiogenerations)
     - [GET /auth/status](#get-authstatus)
     - [POST /v1/session/qr-login](#post-v1sessionqr-login)
@@ -1164,7 +1169,8 @@ curl http://localhost:9090/v1/session/qr-login \
 | `doubao-expert` | chat | 3 | 专家模式（深度推理） |
 | `doubao-pro` | chat | 0 | 快速模式别名 |
 | `doubao-image` | image | — | 图片生成 |
-| `doubao-video` | video | — | 视频生成 |
+| `seedance_v2.0` | video | — | 视频生成，Seedance 2.0 Fast（默认） |
+| `seedance_v2.0_mini` | video | — | 视频生成，Seedance 2.0 Mini |
 | `doubao-music` | audio | — | 音乐生成 |
 
 服务还内置了通义千问后端（`qianwen-*` / `Qwen*` 共 16 个模型 ID），需设置
@@ -1668,19 +1674,18 @@ curl -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png"
 **请求体**：
 ```json
 {
-  "model": "doubao-video",
+  "model": "seedance_v2.0",
   "prompt": "一只柴犬在雪地奔跑",
   "ratio": "16:9",
-  "duration": 4,
-  "video_model": "seedance_v2.0"
+  "duration": 4
 }
 ```
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `prompt` | string | 是 | 视频描述 |
-| `model` | string | 否 | OpenAI 风格别名，固定 `doubao-video`，**不透传**给豆包 |
-| `video_model` | string | 否 | 豆包内部模型 id：`seedance_v2.0`（默认）/ `seedance_v2.0_mini` |
+| `model` | string | 否 | `seedance_v2.0`（默认）/ `seedance_v2.0_mini`。无法识别的值（如 `sora-2`）回退到默认 |
+| `video_model` | string | 否 | 同上，优先级高于 `model`。为兼容旧调用方保留 |
 | `ratio` | string | 否 | `1:1`/`16:9`/`9:16`，也可传 OpenAI 风格 `size` 后自动映射 |
 | `duration` | int | 否 | 时长秒数，默认 `10` |
 | `ref_image` | object | 否 | `/v1/video/ref_image` 的完整返回值（图生视频） |
@@ -1773,6 +1778,142 @@ curl -X POST http://localhost:9090/v1/video/generations \
 
 > 提交被豆包拒绝时（回复类似「出了点问题，请稍后重试」），当前实现仍会轮询到超时才报错，
 > 而不是立即失败。
+
+---
+
+#### POST /v1/videos
+
+OpenAI Videos API（Sora）兼容端点。和 `/v1/video/generations` 走同一条生成链路，
+区别只在交付方式：这里是**异步作业制**——立刻返回一个 `queued` 作业，由调用方轮询，
+视频字节从单独的 `/content` 端点取。
+
+用它而不用 `/v1/video/generations` 的理由只有一个：你的客户端是 OpenAI SDK
+（`client.videos.create()`），需要这套形状。裸 HTTP 调用建议仍用
+`/v1/video/generations`，一次请求拿结果，更简单。
+
+**请求体**（JSON，或 multipart——SDK 在带文件时发 multipart）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `prompt` | string | 是 | 视频描述 |
+| `seconds` | string/int | 否 | 时长秒数，默认 `4`（OpenAI 语义）。豆包不限于 4/8/12 |
+| `size` | string | 否 | `宽x高`，默认 `720x1280`。仅用于换算宽高比 |
+| `model` | string | 否 | `seedance_v2.0`（默认）/ `seedance_v2.0_mini`。OpenAI 客户端传的 `sora-2` 会回退到默认 |
+| `video_model` | string | 否 | 同上，优先级高于 `model` |
+| `input_reference` | file / object | 否 | 图生视频的参考图，见下 |
+| `ref_image` | object | 否 | **扩展字段**。`/v1/video/ref_image` 的完整返回值 |
+
+作业对象里回显的 `model` 是**实际运行**的模型，不是请求里写的——传 `sora-2` 会得到
+`"model": "seedance_v2.0"`。
+
+```bash
+curl -X POST http://localhost:9090/v1/videos \
+  -H "Authorization: Bearer $DOUBAO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"seedance_v2.0","prompt":"一只柴犬在雪地里奔跑，慢镜头","seconds":"4"}'
+```
+
+**参考图的三种传法**，OpenAI 的两种形式都支持：
+
+| 形式 | 说明 |
+|---|---|
+| multipart 文件 | OpenAI SDK 的默认方式。字段名**不限**——任何文件部分都会被当作参考图 |
+| `input_reference.image_url` | http(s) URL 或 `data:` URI，服务端下载后转存。也接受 `{"url": ...}` 嵌套写法与裸字符串 |
+| `ref_image` | 扩展字段，`/v1/video/ref_image` 的完整返回值 |
+
+`input_reference.file_id` **不支持**：`/v1/files` 写入豆包的文档桶
+（`resource_type=1`），视频能力只接受图片桶（`resource_type=2`），两者不通。
+返回 400 并指向 `/v1/video/ref_image`。
+
+> 带了参考图字段但解析不出来时会**立即返回 400**，而不是照常发起一次注定失败的文生视频——
+> 后者要白等 480 秒才暴露问题。
+
+> `image_url` 会让服务端去请求调用方给定的地址。本服务面向本机、带鉴权的部署，
+> 端口若要暴露出去需自行加白名单。下载上限 20 MB。
+
+**响应**（立即返回，不阻塞）：
+
+```json
+{
+  "id": "video_fe8db6df81f546c69609378c7b4be6ad",
+  "object": "video",
+  "model": "seedance_v2.0",
+  "status": "queued",
+  "progress": 0,
+  "created_at": 1788104161,
+  "completed_at": null,
+  "size": "720x1280",
+  "seconds": "4",
+  "error": null,
+  "doubao": null
+}
+```
+
+`status` 取值 `queued` / `in_progress` / `completed` / `failed`。
+
+作业完成后 `size` 和 `seconds` 会被改写为**实际**产出值（请求里的只是偏好，
+豆包不保证遵守），并填充扩展字段 `doubao`：
+
+```json
+"size": "1280x720",
+"doubao": {
+  "vid": "v0269cg10004...",
+  "video_url": "https://v9-default.douyin.com/...&lr=unwatermarked",
+  "cover_url": "https://aka.doubaocdn.com/s/..."
+}
+```
+
+`video_url` 同样是[无水印版本](#无水印视频)。不想经服务端中转的话可以直接用它。
+
+> **`progress` 是估算值。** 豆包不提供任何进度信号，这个百分比由已耗时对约 150 秒的
+> 预期折算得出，未完成时封顶 95。只有 `status` 是可信的。
+
+失败时 `error` 非空：
+
+```json
+"status": "failed",
+"error": {"code": "generation_failed", "message": "generate_video: timed out after 480s ... reply=我暂时无法生成你要求的内容。"}
+```
+
+`code` 可能为 `quota_exhausted`（所有账号额度用尽）、`no_video`（豆包反问或拒绝）、
+`server_error`（未登录 / 验证码）、`generation_failed`（其余，含超时与拒绝）。
+
+> **作业只存在内存里**，重启即丢，最多保留 100 条（超出时淘汰最早的**已结束**作业）。
+> 这是有意为之：视频本身挂在豆包 CDN 的签名 URL 上，本来就会过期，持久化作业多半只是
+> 保存一个死链。
+
+##### GET /v1/videos/{video_id}
+
+查询作业状态，返回同上的作业对象。作业不存在返回 404。
+
+##### GET /v1/videos/{video_id}/content
+
+下载成品字节。`variant` 可选 `video`（默认，`video/mp4`）或 `thumbnail`（`image/jpeg`）；
+OpenAI 还有 `spritesheet`，豆包无对应产物，返回 400。
+
+作业未完成时返回 **409**，不是 404。
+
+```bash
+curl -H "Authorization: Bearer $DOUBAO_API_KEY" \
+  http://localhost:9090/v1/videos/video_xxx/content -o out.mp4
+```
+
+服务端用一个**不带豆包 cookie** 的新连接回源 CDN，逐块转发。若签名 URL 已过期，
+CDN 的错误码无法再反映到已发出的响应头上，客户端会收到一个空 body，服务端日志记
+`the signed URL has most likely expired`。
+
+##### GET /v1/videos
+
+列出仍在内存中的作业。支持 `limit`（≤100，默认 20）、`order`（`desc` 默认 / `asc`）、
+`after`（游标）。
+
+##### DELETE /v1/videos/{video_id}
+
+从作业表移除。视频本身留在豆包 CDN 上，不受影响。
+
+```json
+{"id": "video_xxx", "object": "video.deleted", "deleted": true}
+```
 
 ---
 
