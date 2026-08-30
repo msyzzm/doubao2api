@@ -106,6 +106,48 @@ ATTACHMENT_TYPE_IMAGE = 1
 PAYWALL_EXT_KEY = "inner_paywall_cta_param"
 PASSPORT_INFO_PATH = "/passport/account/info/v2/?account_sdk_source=web"
 PASSPORT_SWITCH_PATH = "/passport/web/account/switch/"
+
+# The account roster is not reachable over HTTP: passport's list endpoints
+# reject Doubao's aid (error_code 16). The switch menu renders it from React
+# props instead, and only while the menu is open, so we open it and read the
+# props off the fiber. sec_id values are the sec_user_id switch_account wants.
+_PROFILES_JS = r"""
+() => {
+  const seen = new Set();
+  let out = null;
+  const scan = (value, depth) => {
+    if (out || depth > 7 || value === null || typeof value !== 'object') return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      const first = value[0];
+      if (first && typeof first.sec_id === 'string'
+          && first.sec_id.indexOf('MS4wLjAB') === 0) {
+        out = value.map((p) => ({
+          sec_user_id: p.sec_id,
+          label: p.nickname || p.user_name || '',
+        }));
+        return;
+      }
+      value.forEach((child) => scan(child, depth + 1));
+      return;
+    }
+    for (const key in value) {
+      if (key === 'stateNode' || key === '_owner' || key === 'return') continue;
+      try { scan(value[key], depth + 1); } catch (e) {}
+    }
+  };
+  for (const el of document.querySelectorAll('div,li,button')) {
+    for (const key in el) {
+      if (key.indexOf('__reactProps') === 0) {
+        try { scan(el[key], 0); } catch (e) {}
+      }
+    }
+    if (out) break;
+  }
+  return out || [];
+}
+"""
 # prepare_upload resource_type: 1 = documents, 2 = message images.
 IMAGE_RESOURCE_TYPE = 2
 CONVERSATION_MODE = 1
@@ -2055,6 +2097,44 @@ class BrowserClient:
             "user_id": data.get("user_id_str", ""),
             "label": data.get("screen_name", ""),
         }
+
+    async def list_accounts(self) -> List[Dict[str, str]]:
+        """Every account logged into this browser profile.
+
+        Reads the switch menu's React props, since no HTTP endpoint will list
+        them. This is UI-coupled by necessity: it drives the avatar menu, so a
+        Doubao redesign breaks it. Returns [] on any failure rather than
+        raising — the caller falls back to the single active account.
+        """
+        if not self._page or not self._ready:
+            return []
+        try:
+            current = await self.current_account()
+            trigger = self._page.get_by_text(
+                current["label"], exact=True
+            ).last
+            await trigger.click(timeout=5000)
+            await self._page.get_by_text(
+                "切换账号", exact=True
+            ).first.hover(timeout=5000)
+            # The submenu mounts asynchronously after the hover.
+            await asyncio.sleep(1)
+            profiles = await self._page.evaluate(_PROFILES_JS)
+        except Exception as exc:
+            log.warning("list_accounts: could not read the switch menu: %s", exc)
+            return []
+        finally:
+            try:
+                await self._page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        accounts = [
+            p for p in (profiles or [])
+            if p.get("sec_user_id") and p.get("label")
+        ]
+        log.info("list_accounts: found %d accounts", len(accounts))
+        return accounts
 
     async def switch_account(self, sec_user_id: str) -> Dict[str, str]:
         """Switch to another account already logged into this browser profile.

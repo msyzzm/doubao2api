@@ -233,6 +233,25 @@ def create_app(
     # Serialize account switches: they mutate the shared browser session.
     _switch_lock = asyncio.Lock()
 
+    async def _sync_accounts(client: BrowserClient) -> int:
+        """Record every account logged into the browser profile.
+
+        Falls back to just the active one when the switch menu cannot be read,
+        so the roster is never left empty.
+        """
+        found = await client.list_accounts()
+        for account in found:
+            _accounts.remember(account["sec_user_id"], account["label"])
+        if found:
+            return len(found)
+        try:
+            current = await client.current_account()
+        except RuntimeError as exc:
+            log.warning("Could not identify current account: %s", exc)
+            return 0
+        _accounts.remember(current["sec_user_id"], current["label"])
+        return 1
+
     async def _browser_watchdog():
         """Background task: check browser health every 30s, auto-restart on crash."""
         while True:
@@ -271,13 +290,7 @@ def create_app(
 
         if client.is_ready:
             log.info("Browser client ready (already logged in)")
-            # Passport will not list a profile's accounts, so the roster grows
-            # from whichever account is active each time we start.
-            try:
-                current = await client.current_account()
-                _accounts.remember(current["sec_user_id"], current["label"])
-            except RuntimeError as exc:
-                log.warning("Could not identify current account: %s", exc)
+            await _sync_accounts(client)
         else:
             log.warning(
                 "Browser not logged in. Visit /auth to scan QR code."
@@ -1122,6 +1135,15 @@ def create_app(
             "current": current,
             "accounts": _accounts.all(),
         })
+
+    @app.post("/admin/api/accounts/sync")
+    async def admin_accounts_sync(request: Request):
+        """Re-read the browser's account menu and record every account found."""
+        _check_auth(request)
+        client = _get_client()
+        async with _switch_lock:
+            count = await _sync_accounts(client)
+        return JSONResponse({"synced": count, "accounts": _accounts.all()})
 
     @app.post("/admin/api/accounts/switch")
     async def admin_accounts_switch(request: Request):
