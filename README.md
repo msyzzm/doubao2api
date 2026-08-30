@@ -53,6 +53,7 @@
     - [GET /admin](#get-admin)
     - [GET /admin/api/accounts](#get-adminapiaccounts)
     - [POST /admin/api/accounts/switch](#post-adminapiaccountsswitch)
+    - [POST /admin/api/accounts/sync](#post-adminapiaccountssync)
   - [使用 OpenAI Python SDK](#使用-openai-python-sdk)
   - [使用 curl](#使用-curl)
 - [Bot ID](#bot-id)
@@ -1750,16 +1751,25 @@ curl -X POST http://localhost:9090/v1/video/generations \
 
 ```json
 [
-  {"sec_user_id": "MS4wLjABAAAA...", "label": "用户324827"},
+  {"sec_user_id": "MS4wLjABAAAA...", "label": "用户324827", "used_on": "2026-08-30", "used_count": 3},
   {"sec_user_id": "MS4wLjABAAAA...", "label": "用户692853", "exhausted_on": "2026-08-30"}
 ]
 ```
 
-> 豆包的 aid 无权调用 passport 的账号列表接口（`error_code 16`），只能查到**当前**账号，
-> 所以名单需要手工补齐：在浏览器里切一次号，再调 `GET /admin/api/accounts` 拿到 `sec_user_id`。
-> 服务启动和每次切号时会自动把当前账号补进名单。
->
-> 只能切换**已经登录到该 browser profile** 的账号，本功能不会替你登录新账号。
+名单由服务自己维护：启动时读取豆包账号菜单，把 profile 内所有已登录账号写进来。
+豆包的 aid 无权调用 passport 的账号列表接口（`error_code 16`），HTTP 层拿不到名单，
+所以这一步是读切换菜单的 React props——**依赖页面结构，豆包改版会失效**。失效时
+不报错，退回到只记录当前账号，视频生成不受影响。
+
+> 只能切换**已经登录到该 browser profile** 的账号。加号仍需手动：在 Chromium 窗口里
+> 头像菜单 → 切换账号 → 添加账号，然后调 `POST /admin/api/accounts/sync`。
+
+**额度是预估值。** 豆包对免费账号不提供额度查询接口（`quota/summary` 的
+`window_limit_section` 为空），所以余量 = 每日 10 次的观测上限 − 本服务发起的生成次数。
+你直接在豆包网页里生成的次数统计不到，实际余量可能更少。
+
+冷却状态则是确定的——只有豆包明确拒绝时才标记。恢复时间按次日零点估算，
+豆包只告知 `reset_period=1`（按天重置），未给出具体时刻。
 
 > 提交被豆包拒绝时（回复类似「出了点问题，请稍后重试」），当前实现仍会轮询到超时才报错，
 > 而不是立即失败。
@@ -1890,6 +1900,13 @@ curl -X POST http://localhost:9090/v1/video/generations \
 
 切换到 profile 内另一个已登录账号。请求体 `{"sec_user_id": "MS4wLjABAAAA..."}`，
 返回切换后的账号信息。视频生成的额度失败会自动调用它，一般无需手动触发。
+
+#### POST /admin/api/accounts/sync
+
+重新读取浏览器的账号菜单，把 profile 内**所有**已登录账号补进名单，返回 `{"synced": N}`。
+服务启动时会自动跑一次。读取失败时退回到只记录当前账号（`synced` 为 1）。
+
+Admin 页面的「账号」标签展示同一份数据：状态、预估余量、冷却倒计时，并可手动切号。
 
 ### 使用 OpenAI Python SDK
 

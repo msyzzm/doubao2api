@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .accounts import AccountPool
+from .accounts import AccountPool, FREE_DAILY_QUOTA
 from .browser_client import BrowserClient, QuotaExhaustedError
 from .qianwen_client import QianwenClient, QIANWEN_MODELS
 from .tool_calling import (
@@ -1091,7 +1091,7 @@ def create_app(
         """
         while True:
             try:
-                return await client.generate_video(**kwargs)
+                result = await client.generate_video(**kwargs)
             except QuotaExhaustedError as exc:
                 async with _switch_lock:
                     try:
@@ -1119,6 +1119,15 @@ def create_app(
                     _accounts.remember(
                         switched["sec_user_id"], switched["label"]
                     )
+                continue
+
+            try:
+                used_by = await client.current_account()
+                _accounts.record_usage(used_by["sec_user_id"])
+            except RuntimeError as exc:
+                # Usage counting is cosmetic; never fail a finished video.
+                log.warning("Could not record quota usage: %s", exc)
+            return result
 
     @app.get("/admin/api/accounts")
     async def admin_accounts(request: Request):
@@ -1133,7 +1142,8 @@ def create_app(
                 log.warning("admin_accounts: %s", exc)
         return JSONResponse({
             "current": current,
-            "accounts": _accounts.all(),
+            "quota_estimate": FREE_DAILY_QUOTA,
+            "accounts": _accounts.snapshot(current),
         })
 
     @app.post("/admin/api/accounts/sync")
@@ -1143,7 +1153,7 @@ def create_app(
         client = _get_client()
         async with _switch_lock:
             count = await _sync_accounts(client)
-        return JSONResponse({"synced": count, "accounts": _accounts.all()})
+        return JSONResponse({"synced": count})
 
     @app.post("/admin/api/accounts/switch")
     async def admin_accounts_switch(request: Request):

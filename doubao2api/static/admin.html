@@ -219,6 +219,67 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 <td class="py-2 px-3 text-slate-400 font-mono">{{l.ms}}ms</td></tr>
 <tr v-if="!logs.length"><td colspan="6" class="py-8 text-center text-slate-500">暂无请求记录</td></tr>
 </tbody></table></div></div></section>
+<!-- TAB 4: 账号 -->
+<section v-show="activeTab===4">
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+<div class="metric card card-glow"><div class="text-xs text-slate-400 mb-1">已登录账号</div>
+<div class="text-lg font-semibold text-white">{{accounts.length}}</div></div>
+<div class="metric card"><div class="text-xs text-slate-400 mb-1">可用</div>
+<div class="text-lg font-semibold text-green-400">{{readyCount}}</div></div>
+<div class="metric card"><div class="text-xs text-slate-400 mb-1">冷却中</div>
+<div class="text-lg font-semibold" :class="cooldownCount?'text-amber-400':'text-slate-500'">{{cooldownCount}}</div></div>
+<div class="metric card"><div class="text-xs text-slate-400 mb-1">剩余额度 (预估)</div>
+<div class="text-lg font-semibold text-brand-400">{{totalRemaining}}</div></div>
+</div>
+<div class="flex items-center gap-3 mb-4">
+<button @click="fetchAccounts" class="btn">刷新</button>
+<button @click="syncAccounts" :disabled="acct.syncing" class="btn-warn">{{acct.syncing?'扫描中...':'扫描浏览器账号'}}</button>
+<span v-if="acct.msg" class="text-sm text-slate-400">{{acct.msg}}</span>
+</div>
+<div class="space-y-3">
+<div v-for="a in accounts" :key="a.sec_user_id"
+:class="['card flex items-center gap-4',a.is_current?'card-glow border-brand-500/40':'']">
+<span :class="['w-2.5 h-2.5 rounded-full shrink-0',
+a.state==='cooldown'?'bg-amber-400':(a.is_current?'bg-green-400 pulse':'bg-slate-600')]"></span>
+<div class="min-w-0 w-40 shrink-0">
+<div class="text-sm font-medium text-white truncate">{{a.label||'(未命名)'}}</div>
+<div class="text-xs font-mono text-slate-600 truncate">{{a.sec_user_id.slice(0,16)}}…</div>
+</div>
+<div class="shrink-0 w-20">
+<span v-if="a.is_current" class="px-2 py-0.5 rounded text-xs bg-brand-500/20 text-brand-400">使用中</span>
+<span v-else-if="a.state==='cooldown'" class="px-2 py-0.5 rounded text-xs bg-amber-900/40 text-amber-300">冷却中</span>
+<span v-else class="px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-400">待用</span>
+</div>
+<div class="flex-1 min-w-0">
+<div class="flex items-center justify-between text-xs mb-1">
+<span class="text-slate-500">{{a.state==='cooldown'?'今日额度已用尽':'今日剩余 (预估)'}}</span>
+<span :class="a.state==='cooldown'?'text-amber-400':'text-slate-300'" class="font-mono">
+{{a.state==='cooldown'?0:a.remaining_estimate}} / {{a.quota_estimate}}</span>
+</div>
+<div class="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+<div class="h-full rounded-full transition-all"
+:class="a.state==='cooldown'?'bg-amber-500':'bg-brand-500'"
+:style="{width:(a.state==='cooldown'?100:Math.round(a.used_today/a.quota_estimate*100))+'%'}"></div>
+</div>
+<div v-if="a.state==='cooldown'" class="text-xs text-amber-500/80 mt-1">
+预计 {{fmtReset(a.cooldown_until)}} 恢复 · 还有 {{fmtDur(a.cooldown_seconds)}}
+</div>
+</div>
+<button v-if="!a.is_current" @click="switchAccount(a)" :disabled="acct.switching" class="btn-sm shrink-0">切换</button>
+</div>
+<div v-if="!accounts.length" class="card text-center text-slate-500 py-8">
+暂无账号数据，点「扫描浏览器账号」从豆包账号菜单读取
+</div>
+</div>
+<div class="card mt-4 text-xs text-slate-500 leading-relaxed">
+<div class="text-slate-400 mb-1">关于额度</div>
+豆包对免费账号<strong class="text-slate-300">不提供额度查询接口</strong>，这里的数字是按每日 {{acct.quota}} 次的
+观测上限，减去<strong class="text-slate-300">本服务</strong>发起的生成次数得出的<strong class="text-slate-300">预估值</strong>。
+你直接在豆包网页里生成的次数统计不到，所以实际余量可能更少。<br>
+只有豆包明确拒绝（回复「今日视频生成免费次数用完了」）时才会标记为冷却中——这个状态是确定的。
+恢复时间按次日零点估算：豆包只说明「按天重置」，未给出具体时刻。
+</div>
+</section>
 </div></div></div>
 <script>
 const NOVNC_URL="{{NOVNC_URL}}";
@@ -227,12 +288,13 @@ createApp({setup(){
 const API=window.location.origin;
 const key=new URLSearchParams(window.location.search).get('key')||'';
 const headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'};
-const tabs=ref([{name:'概览'},{name:'登录'},{name:'API 测试'},{name:'请求日志'}]);
+const tabs=ref([{name:'概览'},{name:'登录'},{name:'API 测试'},{name:'请求日志'},{name:'账号'}]);
 const icons=[
 '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>',
 '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"/></svg>',
 '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>',
-'<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>'];
+'<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>',
+'<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/></svg>'];
 const activeTab=ref(0);
 const session=ref(null);
 const sysInfo=ref(null);
@@ -244,6 +306,11 @@ const logs=ref([]);
 const screenshot=reactive({img:"",loading:false,time:""});
 const currentTime=ref('');
 const allModels=ref([]);
+const accounts=ref([]);
+const acct=reactive({syncing:false,switching:false,msg:'',quota:10});
+const readyCount=computed(()=>accounts.value.filter(a=>a.state!=='cooldown').length);
+const cooldownCount=computed(()=>accounts.value.filter(a=>a.state==='cooldown').length);
+const totalRemaining=computed(()=>accounts.value.reduce((n,a)=>n+(a.state==='cooldown'?0:a.remaining_estimate),0));
 const qrColor=computed(()=>({'text-green-400':qr.st==='success'||qr.st==='confirmed','text-yellow-400':qr.st==='scanned','text-slate-400':qr.st==='waiting_scan','text-red-400':qr.st==='expired'||qr.st==='failed'}));
 function fmtDur(s){if(!s&&s!==0)return'N/A';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(ts){if(!ts)return'';return new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false})}
@@ -265,6 +332,22 @@ allModels.value=ids;
 if(ids.length&&!ids.includes(test.model))test.model=ids.includes('doubao-think')?'doubao-think':ids[0];
 }catch(e){}}
 async function fetchOverview(){fetchSession();fetchSystem();fetchCookies();fetchModels()}
+function fmtReset(iso){if(!iso)return'';const d=new Date(iso);
+return d.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})}
+async function fetchAccounts(){try{const d=await api('/admin/api/accounts');
+accounts.value=d.accounts||[];if(d.quota_estimate)acct.quota=d.quota_estimate}catch(e){}}
+async function syncAccounts(){acct.syncing=true;acct.msg='';
+try{const d=await api('/admin/api/accounts/sync',{method:'POST'});
+acct.msg=d.synced?('已扫描到 '+d.synced+' 个账号'):'未能读取账号菜单，仅记录当前账号';
+await fetchAccounts()}
+catch(e){acct.msg='扫描失败: '+e.message}
+finally{acct.syncing=false}}
+async function switchAccount(a){if(!confirm('切换到 '+(a.label||'该账号')+'？当前会话会指向新账号。'))return;
+acct.switching=true;acct.msg='';
+try{const d=await api('/admin/api/accounts/switch',{method:'POST',body:JSON.stringify({sec_user_id:a.sec_user_id})});
+acct.msg=d.label?('已切换到 '+d.label):('切换失败: '+(d.detail||'unknown'));await fetchAccounts()}
+catch(e){acct.msg='切换失败: '+e.message}
+finally{acct.switching=false}}
 let qrPoll=null;
 async function startQr(){qr.img='';qr.st='';qr.text='生成中...';
 try{const r=await api('/v1/session/qr-login',{method:'POST'});
@@ -311,11 +394,14 @@ const msg=r.choices?.[0]?.message||{};test.output=msg.content||JSON.stringify(r,
 if(msg.reasoning_content)test.thinking=msg.reasoning_content;if(r.search_results)test.searchResults=r.search_results;test.ms=Date.now()-t0;
 }}catch(e){test.error=e.message}finally{test.loading=false}}
 setInterval(()=>{currentTime.value=new Date().toLocaleTimeString('zh-CN',{hour12:false})},1000);
-onMounted(()=>{fetchOverview();fetchLogs();currentTime.value=new Date().toLocaleTimeString('zh-CN',{hour12:false});
+onMounted(()=>{fetchOverview();fetchLogs();fetchAccounts();currentTime.value=new Date().toLocaleTimeString('zh-CN',{hour12:false});
 setInterval(()=>{if(activeTab.value===0)fetchSession()},10000);
-setInterval(()=>{if(activeTab.value===3)fetchLogs()},5000)});
+setInterval(()=>{if(activeTab.value===3)fetchLogs()},5000);
+setInterval(()=>{if(activeTab.value===4)fetchAccounts()},15000)});
 return{tabs,icons,activeTab,session,sysInfo,cookieData,probe,qr,qrColor,test,logs,allModels,currentTime,screenshot,
-fmtDur,fmtTime,fetchOverview,probeSession,fetchLogs,startQr,loadVnc,takeScreenshot,runTest}}}).mount('#app');
+accounts,acct,readyCount,cooldownCount,totalRemaining,
+fmtDur,fmtTime,fmtReset,fetchOverview,probeSession,fetchLogs,startQr,loadVnc,takeScreenshot,runTest,
+fetchAccounts,syncAccounts,switchAccount}}}).mount('#app');
 </script>
 </body>
 </html>
