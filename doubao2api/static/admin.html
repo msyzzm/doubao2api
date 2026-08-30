@@ -243,7 +243,7 @@ const test=reactive({model:'doubao-think',stream:true,prompt:'',output:'',thinki
 const logs=ref([]);
 const screenshot=reactive({img:"",loading:false,time:""});
 const currentTime=ref('');
-const allModels=['doubao','doubao-quick','doubao-think','doubao-auto','doubao-expert','doubao-pro','doubao-image','doubao-video','doubao-music'];
+const allModels=ref([]);
 const qrColor=computed(()=>({'text-green-400':qr.st==='success'||qr.st==='confirmed','text-yellow-400':qr.st==='scanned','text-slate-400':qr.st==='waiting_scan','text-red-400':qr.st==='expired'||qr.st==='failed'}));
 function fmtDur(s){if(!s&&s!==0)return'N/A';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(ts){if(!ts)return'';return new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false})}
@@ -257,7 +257,14 @@ finally{probe.loading=false}}
 async function fetchSystem(){try{sysInfo.value=await api('/admin/api/system')}catch(e){}}
 async function fetchCookies(){try{const d=await api('/admin/api/cookies');cookieData.cookies=d.cookies||[];cookieData.total=d.total||0;cookieData.file=d.session_file||null}catch(e){}}
 async function fetchLogs(){try{logs.value=(await api('/admin/api/logs')).reverse()}catch(e){}}
-async function fetchOverview(){fetchSession();fetchSystem();fetchCookies()}
+async function fetchModels(){try{
+const[list,health]=await Promise.all([api('/v1/models'),api('/health')]);
+const readyBy={doubao:!!health.logged_in,qianwen:!!health.qianwen_ready};
+const ids=(list.data||[]).filter(m=>readyBy[m.owned_by]!==false).map(m=>m.id);
+allModels.value=ids;
+if(ids.length&&!ids.includes(test.model))test.model=ids.includes('doubao-think')?'doubao-think':ids[0];
+}catch(e){}}
+async function fetchOverview(){fetchSession();fetchSystem();fetchCookies();fetchModels()}
 let qrPoll=null;
 async function startQr(){qr.img='';qr.st='';qr.text='生成中...';
 try{const r=await api('/v1/session/qr-login',{method:'POST'});

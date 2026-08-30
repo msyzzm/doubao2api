@@ -506,7 +506,16 @@ def create_app(
     @app.get("/v1/models")
     async def list_models(request: Request):
         _check_auth(request)
-        return {"object": "list", "data": ALL_MODELS}
+        client = _browser.get("client")
+        qw = _qianwen.get("client")
+        ready = {
+            "doubao": client.is_ready if client else False,
+            "qianwen": qw.is_ready if qw else False,
+        }
+        # Unknown owners stay listed: a backend added later without registering
+        # here should be visible rather than silently disappear.
+        data = [m for m in ALL_MODELS if ready.get(m["owned_by"], True)]
+        return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
@@ -1017,6 +1026,35 @@ def create_app(
             "data": tracks,
         })
 
+    @app.post("/v1/video/ref_image")
+    async def upload_video_ref_image(request: Request):
+        """Upload an image for image-to-video and register it with Doubao."""
+        _check_auth(request)
+        await bucket.acquire()
+        client = _get_client()
+        form = await request.form()
+        upload = form.get("file") or form.get("image")
+        if not upload:
+            raise HTTPException(status_code=400, detail="Missing file field")
+        data = await upload.read()
+        try:
+            result = await client.upload_ref_image(data, upload.filename or "image.png")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        return JSONResponse(result)
+
+    def _video_ref_image(body: dict) -> Optional[dict]:
+        """Build the image-to-video reference from the request body.
+
+        Accepts either a full object under "ref_image" or the bare TOS uri in
+        "ref_image_key" (the key returned by /v1/images/upload).
+        """
+        ref = body.get("ref_image")
+        if isinstance(ref, dict) and ref.get("uri"):
+            return ref
+        key = body.get("ref_image_key")
+        return {"uri": key} if key else None
+
     @app.post("/v1/video/generations")
     async def video_generations(request: Request):
         _check_auth(request)
@@ -1035,6 +1073,11 @@ def create_app(
         try:
             result = await client.generate_video(
                 prompt=prompt, ratio=ratio,
+                duration=int(body.get("duration") or 10),
+                # "model" here is the OpenAI-style alias (doubao-video); the
+                # internal Doubao model id goes in "video_model".
+                model=body.get("video_model") or None,
+                ref_image=_video_ref_image(body),
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1795,6 +1838,19 @@ def create_app(
             return {"result": result}
         except Exception as e:
             return {"error": str(e)}
+
+    @app.get("/auth/pull_conv")
+    async def auth_pull_conv(request: Request, conversation_id: str):
+        """Exercise the history-polling path against an existing conversation."""
+        if os.environ.get("DOUBAO_DEBUG_CAPTURE", "false").lower() != "true":
+            raise HTTPException(status_code=404, detail="Not Found")
+        _check_auth(request)
+        client = _get_client()
+        messages = await client._pull_conversation_messages(conversation_id)
+        return {
+            "messages": len(messages),
+            "videos": client._extract_videos(messages),
+        }
 
     @app.get("/auth/screenshot")
     async def auth_screenshot(request: Request):

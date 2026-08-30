@@ -43,6 +43,7 @@
     - [GET /v1/files/download](#get-v1filesdownload)
     - [POST /v1/images/upload](#post-v1imagesupload)
     - [POST /v1/images/generations](#post-v1imagesgenerations)
+    - [POST /v1/video/ref_image](#post-v1videoref_image)
     - [POST /v1/video/generations](#post-v1videogenerations)
     - [POST /v1/audio/generations](#post-v1audiogenerations)
     - [GET /auth/status](#get-authstatus)
@@ -87,7 +88,9 @@
 
 | 端点 | 协议 | 思考链 | 状态 |
 |------|------|--------|------|
-| `POST /samantha/chat/completion` | JSON 明文 sentEvent | **有** — `block_type=10040` + `10000` | ✅ 推荐主用 |
+| `POST /chat/completion` | JSON 明文 sentEvent | **有** — `block_type=10040` + `10000` | ✅ 当前主用（对话 + 视频生成） |
+| `POST /im/chain/single` | JSON | — | 拉取会话历史，用于取回异步生成结果 |
+| `POST /samantha/chat/completion` | JSON 明文 sentEvent | **有** | 图片/音乐生成仍在用；视频已迁走 |
 | `POST /alice/message/stream_call_bot` | base64 编码 payload | **无** | 旧端点，已废弃 |
 
 - 认证: Cookie (`sessionid`, `ttwid`, `passport_csrf_token`)
@@ -406,51 +409,111 @@ async with DoubaoChatClient.from_session() as client:
 
 ### 视频生成（文生视频）
 
-使用 Seedance 2.0 全能视频模型，每日约 10 次免费额度。
+使用 Seedance 2.0 视频模型，每日约 10 次免费额度。实测一条 4 秒视频约 2 分钟出片。
+
+> ⚠️ 豆包已把视频生成从 `/samantha/chat/completion` 迁移到普通聊天端点 `/chat/completion`
+> （通过 `chat_ability` 字段承载）。本节描述的是迁移后的实现，位于 `BrowserClient`
+> （统一 API 服务使用的客户端）。`DoubaoChatClient`（`client.py`）中基于
+> `content_type=2020` + `/samantha/chat/async/stream` 的旧实现**已失效**，尚未迁移。
 
 ```python
-async with DoubaoChatClient.from_session() as client:
-    result = await client.generate_video(
-        prompt="一只柴犬在雪地里奔跑",
-        ratio="16:9",
-        timeout=300,
-    )
-    for v in result.videos:
-        print(f"视频: {v.video_url}")
-        print(f"时长: {v.duration}s")
+from doubao2api import BrowserClient
+
+client = BrowserClient(headless=False, user_data_dir=".browser_data")
+await client.start()
+
+result = await client.generate_video(
+    prompt="一只柴犬在雪地里奔跑",
+    ratio="16:9",
+    duration=4,
+)
+for v in result["videos"]:
+    print(f"视频: {v['video_url']}")
+    print(f"时长: {v['duration']}s")
 ```
 
 #### 图生视频（img2video）
 
+参考图必须先上传**并注册**。注册返回的 `identifier` 会被带进消息附件块，两者不一致时豆包会拒绝请求。
+
 ```python
-async with DoubaoChatClient.from_session() as client:
-    att = await client.upload_image(open("ref.png", "rb").read(), "ref.png")
-    result = await client.generate_video(
-        prompt="让画面动起来，镜头缓慢推进",
-        ref_image_key=att["uri"],
-        ratio="16:9",
-    )
+data = open("ref.png", "rb").read()
+ref = await client.upload_ref_image(data, "ref.png")
+# ref: {"uri": "tos-cn-i-a9rns2rl98/xxx.png", "name": "ref.png",
+#       "identifier": "...", "width": 940, "height": 1674}
+
+result = await client.generate_video(
+    prompt="角色原地待机动画，不要添加新的元素，固定镜头",
+    ref_image=ref,       # 整个对象传入，不要只传 uri
+    duration=4,
+)
 ```
+
+> 参考图必须落在**图片**存储桶（`prepare_upload` 的 `resource_type=2`，
+> 对应 `tos-cn-i-a9rns2rl98/`）。`upload_file()` 默认的 `resource_type=1`
+> 是文档桶，视频能力不接受。`upload_ref_image()` 已处理好这一点。
 
 #### 视频参数
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `prompt` | str | 视频描述文本（必需） |
-| `ratio` | str | 宽高比：`"1:1"`, `"16:9"`, `"9:16"` |
-| `camera_movement` | str | 镜头运动方式（可选） |
-| `ref_image_key` | str | 参考图片 key（img2video，可选） |
-| `timeout` | float | 最长等待秒数，默认 300 |
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `prompt` | str | — | 视频描述文本（必需） |
+| `ratio` | str | `"auto"` | 宽高比：`"1:1"`, `"16:9"`, `"9:16"` |
+| `duration` | int | `10` | 时长（秒） |
+| `model` | str | `"seedance_v2.0"` | 豆包内部模型 id，见下表 |
+| `ref_image` | dict | `None` | `upload_ref_image()` 的返回值（img2video） |
+| `timeout` | float | `480` | 最长等待秒数 |
+| `poll_interval` | float | `10` | 轮询间隔秒数 |
 
-#### 异步流程
+#### 视频模型
+
+取值来自网页端 localStorage 的 `action_bar_selected_options`：
+
+| `model` | 界面名称 | 说明 |
+|---------|----------|------|
+| `seedance_v2.0` | Seedance 2.0 Fast | 快速出片（默认） |
+| `seedance_v2.0_mini` | Seedance 2.0 Mini | 日常生成 |
+
+> 选项 `id` 分别是 4 和 6，中间跳号，可能还存在其他档位（例如会员专属），取值未知。
+
+#### 请求与交付流程
 
 ```
-1. POST /samantha/chat/completion (content_type=2020)
-   ↓ SSE 返回文本确认 + fin_reason.async_task.id
-2. POST /samantha/chat/async/stream (body: {task_id, event_id: 0})
-   ↓ SSE 长连接等待 1-3 分钟
-3. 收到 content_type=2021 (SamanthaVideoGenerationOutput) → 视频 URL
+1. POST /chat/completion
+   body.chat_ability = {"ability_type": 17, "ability_param": "{...}"}
+   ability_param  = {ratio, model, duration, input_box_content}
+   ↓ SSE 约 5 秒结束，只返回文字确认，不含视频
+   ↓ 从 SSE 中取出 conversation_id
+
+2. 轮询 POST /im/chain/single (cmd=3100)
+   ↓ 直到会话里出现生成结果（实测 1-3 分钟）
+
+3. 从历史消息中提取视频
 ```
+
+网页端实际由 Web Worker 里的推送通道触发拉取历史，本项目改为主动轮询，效果一致。
+
+图生视频时消息体是**两条消息**，顺序不能颠倒：
+
+```
+messages[0] → block_type 10052 附件块（identifier 必须与注册时一致）
+messages[1] → block_type 10000 文本块，内容为 "生成视频：{prompt}，{duration}s"
+```
+
+只发附件不发文本，豆包会把请求当作**图片编辑**处理，返回一张图而不是视频。
+
+视频结果在历史消息中有两种载体，需都做解析：
+
+| 载体 | 路径 |
+|------|------|
+| A | `messages[].ext.creation_material_info`（JSON 字符串）→ `<id>.result.video` |
+| B | `messages[].content_block[block_type=2074].content.creation_block.creations[]` |
+
+两者字段名不同（`cover_image.preview_img` vs `cover.image_preview`），载体 B 还带 `status`（`3` = 完成）。
+
+> `/im/*` 端点要求 `Content-Type: application/json; encoding=utf-8`，
+> 用普通 `application/json` 会被拒：`status_code=712012002 不支持编码类型`。
+> 这些端点**出错时仍返回 HTTP 200**，错误码在响应体的 `status_code` 里，必须校验。
 
 ### 音乐生成（文生音乐）
 
@@ -1099,6 +1162,12 @@ curl http://localhost:9090/v1/session/qr-login \
 | `doubao-video` | video | — | 视频生成 |
 | `doubao-music` | audio | — | 音乐生成 |
 
+服务还内置了通义千问后端（`qianwen-*` / `Qwen*` 共 16 个模型 ID），需设置
+`QIANWEN_ENABLED=true` 并单独扫码登录才会启动。
+
+`GET /v1/models` 只返回**已就绪后端**的模型：豆包未登录时不列 `doubao-*`，
+未启用千问时不列 `qianwen-*`。Admin 面板的模型下拉框同样按此过滤。
+
 ### 端点详细规范
 
 #### GET /health
@@ -1554,34 +1623,100 @@ curl http://localhost:9090/v1/images/generations \
 
 ---
 
+#### POST /v1/video/ref_image
+
+图生视频专用的参考图上传端点。上传到图片存储桶并向豆包注册，返回可直接用于
+`/v1/video/generations` 的 `ref_image` 对象。
+
+**请求格式**：`multipart/form-data`
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file` | file | 是 | 图片文件（png/jpg/webp） |
+
+```bash
+curl -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png"
+```
+
+**响应**：
+```json
+{
+  "uri": "tos-cn-i-a9rns2rl98/294a660ee6e3459fa3d5390b0fa04e4d.png",
+  "name": "ref.png",
+  "identifier": "105c7e6a-a45f-11f1-b67f-001a7dda7111",
+  "width": 940,
+  "height": 1674
+}
+```
+
+> 不要用 `/v1/images/upload`：它落在另一个存储桶（`ocean-cloud-tos`），
+> 视频能力不接受，且不会执行注册步骤。宽高目前只能从 PNG 头解析，
+> 其他格式返回 `0`。
+
+---
+
 #### POST /v1/video/generations
 
-视频生成端点。当前接口会在请求内等待任务结果，成功后直接返回视频列表。
+视频生成端点。接口会在请求内等待任务完成后直接返回视频列表，实测 4 秒视频约需 2 分钟，
+默认最长等待 480 秒。反向代理需相应放宽读超时。
 
 **请求体**：
 ```json
 {
   "model": "doubao-video",
   "prompt": "一只柴犬在雪地奔跑",
-  "ratio": "16:9"
+  "ratio": "16:9",
+  "duration": 4,
+  "video_model": "seedance_v2.0"
 }
 ```
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `prompt` | string | 是 | 视频描述 |
-| `model` | string | 否 | 固定 `doubao-video` |
+| `model` | string | 否 | OpenAI 风格别名，固定 `doubao-video`，**不透传**给豆包 |
+| `video_model` | string | 否 | 豆包内部模型 id：`seedance_v2.0`（默认）/ `seedance_v2.0_mini` |
 | `ratio` | string | 否 | `1:1`/`16:9`/`9:16`，也可传 OpenAI 风格 `size` 后自动映射 |
+| `duration` | int | 否 | 时长秒数，默认 `10` |
+| `ref_image` | object | 否 | `/v1/video/ref_image` 的完整返回值（图生视频） |
+| `ref_image_key` | string | 否 | 只传 uri 的简写形式；缺少 `identifier`，**可能被豆包拒绝** |
+
+**图生视频示例**：
+```bash
+REF=$(curl -s -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png")
+curl -X POST http://localhost:9090/v1/video/generations \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\":\"角色原地待机动画，固定镜头\",\"duration\":4,\"ref_image\":$REF}"
+```
 
 **响应**：
 ```json
 {
   "created": 1700000000,
   "data": [
-    {"video_url": "https://...", "cover_url": "https://...", "duration": 5.0, "width": 1920, "height": 1080}
+    {
+      "vid": "v0369cg10004daa0ndq7dld6spihm76g",
+      "video_url": "https://v3-default.douyin.com/...&download=true",
+      "cover_url": "https://p11-flow-imagex-sign.byteimg.com/...",
+      "duration": 4.065,
+      "video_type": "mp4",
+      "width": 720,
+      "height": 1280
+    }
   ]
 }
 ```
+
+**错误码**：
+
+| HTTP 状态 | 说明 |
+|-----------|------|
+| 400 | 缺少 `prompt` |
+| 503 | 未登录、浏览器未初始化或需要验证码 |
+| 502 | 提交被拒、轮询失败或等待超时 |
+
+> 提交被豆包拒绝时（回复类似「出了点问题，请稍后重试」），当前实现仍会轮询到超时才报错，
+> 而不是立即失败。
 
 ---
 
@@ -1945,10 +2080,23 @@ SSE 事件的 `message.ext` 字段包含：
 | 2008 | SamanthaSearchText | 思考链增量文本 |
 | 2009 | SamanthaImageInput | 图片输入 |
 | 2010 | SamanthaImageOutput | 图片输出 |
-| 2020 | SamanthaVideoGenerationInput | 视频生成输入 |
-| 2021 | SamanthaVideoGenerationOutput | 视频生成输出 |
+| 2020 | SamanthaVideoGenerationInput | 视频生成输入（**已废弃**，见下） |
+| 2021 | SamanthaVideoGenerationOutput | 视频生成输出（**已废弃**，见下） |
 | 10000 | SamanthaTextV2 | 主回答文本（思考/专家模式） |
 | 10040 | BlockTypeThink | 思考内容块 |
+
+聊天消息里另有几个 `block_type`：
+
+| 值 | 说明 |
+|----|------|
+| 10000 | 文本块 `text_block` |
+| 10040 | 思考内容块 |
+| 10052 | 附件块 `attachment_block`（`type=1` 图片，`type=3` 文件） |
+| 2074 | 创作结果块 `creation_block`（视频/图片产物） |
+
+> 视频生成已迁移到 `/chat/completion` 的 `chat_ability`（`ability_type=17`），
+> 不再使用 `content_type=2020/2021` 与 `/samantha/chat/async/stream`。
+> 详见[视频生成](#视频生成文生视频)。
 
 ### 思考链提取
 

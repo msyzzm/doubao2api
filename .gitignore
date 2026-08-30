@@ -3,6 +3,11 @@
 decrypted_cookies.json
 .env
 
+# Persistent browser profiles (contain login cookies)
+.browser_data*/
+.doubao_browser/
+.qianwen_browser/
+
 # Python
 __pycache__/
 *.pyc

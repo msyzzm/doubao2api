@@ -15,8 +15,11 @@ and call this signing function. All actual API traffic goes through httpx.
 import asyncio
 import json
 import logging
+import os
+import struct
 import time
 import uuid
+from urllib.parse import urlencode
 from typing import AsyncGenerator, Optional, Dict, Any, List
 from urllib.parse import urlencode
 
@@ -31,6 +34,76 @@ CHAT_URL = f"{DOUBAO_URL}/chat/"
 COMPLETION_URL = f"{DOUBAO_URL}/chat/completion"
 SAMANTHA_COMPLETION_URL = f"{DOUBAO_URL}/samantha/chat/completion"
 DEFAULT_BOT_ID = "7338286299411103781"
+# Keep in sync with the real web client; a stale value trips risk control.
+PC_VERSION = "3.34.0"
+
+# Diagnostic probe, injected before page scripts when DOUBAO_DEBUG_CAPTURE=true.
+# Survives reloads, so it can observe how a generated video is delivered.
+_DEBUG_PROBE_JS = r"""
+(() => {
+  if (window.__probe) return;
+  const P = {ws: [], req: [], sse: []};
+  window.__probe = P;
+  const now = () => Math.round(performance.now());
+  const cap = (arr, max, item) => { if (arr.length < max) arr.push(item); };
+
+  const OW = window.WebSocket;
+  window.WebSocket = function (u, p) {
+    const s = p === undefined ? new OW(u) : new OW(u, p);
+    cap(P.ws, 500, {t: now(), kind: 'open', url: String(u)});
+    s.addEventListener('message', (e) => {
+      let d = e.data;
+      if (typeof d !== 'string') { cap(P.ws, 500, {t: now(), kind: 'bin', size: (d && d.size) || 0}); return; }
+      cap(P.ws, 500, {t: now(), kind: 'msg', len: d.length, head: d.slice(0, 400)});
+    });
+    return s;
+  };
+  window.WebSocket.prototype = OW.prototype;
+  Object.assign(window.WebSocket, OW);
+
+  const of = window.fetch;
+  window.fetch = async function (input, init) {
+    const u = (typeof input === 'string') ? input : (input && input.url) || '';
+    const t0 = now();
+    const res = await of.apply(this, arguments);
+    try {
+      if (u.indexOf('/chat/completion') !== -1) {
+        const body = (init && typeof init.body === 'string') ? init.body : '';
+        res.clone().text().then((t) => {
+          cap(P.sse, 40, {t0: t0, t1: now(), url: u.split('?')[0],
+                          reqBody: body.slice(0, 3000), len: t.length,
+                          has2074: t.indexOf('2074') !== -1, tail: t.slice(-3000)});
+        }).catch(() => {});
+      } else if (/\/im\/|conversation|message|task|video/i.test(u)) {
+        const body = (init && typeof init.body === 'string') ? init.body : '';
+        res.clone().text().then((t) => {
+          cap(P.req, 200, {t: now(), url: u.split('?')[0],
+                           m: (init && init.method) || 'GET',
+                           reqBody: body.slice(0, 2000), resp: t.slice(0, 4000)});
+        }).catch(() => {});
+      }
+    } catch (e) {}
+    return res;
+  };
+})();
+"""
+# Mode descriptors observed in the current web client. Doubao now carries the
+# mode in model_config/aggregate_params; need_deep_think is still sent too.
+AGENT_MODE = 2
+# Video/image results arrive as a "creation" block in the conversation history.
+CREATION_BLOCK_TYPE = 2074
+CREATION_TYPE_VIDEO = 2
+VIDEO_STATUS_DONE = 3
+VIDEO_ABILITY_TYPE = 17
+VIDEO_MODEL = "seedance_v2.0"
+ATTACHMENT_BLOCK_TYPE = 10052
+ATTACHMENT_TYPE_IMAGE = 1
+# prepare_upload resource_type: 1 = documents, 2 = message images.
+IMAGE_RESOURCE_TYPE = 2
+CONVERSATION_MODE = 1
+MODE_ID = "1"
+MODEL_ITEM_KEY = "0"
+REASONING_EFFORT = 3
 
 
 class BrowserClient:
@@ -131,6 +204,10 @@ class BrowserClient:
         # Stealth patches
         stealth = Stealth(navigator_languages_override=("zh-CN", "zh"))
         await stealth.apply_stealth_async(self._page)
+
+        if os.environ.get("DOUBAO_DEBUG_CAPTURE", "false").lower() == "true":
+            await self._context.add_init_script(_DEBUG_PROBE_JS)
+            log.info("Debug capture probe installed (window.__probe)")
 
         # Navigate
         log.info("Navigating to %s", CHAT_URL)
@@ -417,22 +494,26 @@ class BrowserClient:
             "aid": "497858",
             "device_id": self._device_id or "",
             "device_platform": "web",
+            "doubao_device_platform": "web",
+            "doubao_pc_version": PC_VERSION,
             "fp": self._fp or "",
             "language": "zh",
-            "pc_version": "3.19.4",
+            "pc_version": PC_VERSION,
             "pkg_type": "release_version",
             "real_aid": "497858",
-            "region": "",
+            "region": "CN",
             "samantha_web": "1",
-            "sys_region": "",
+            "sys_region": "CN",
             "tea_uuid": self._web_id or "",
+            "tz_name": "Asia/Shanghai",
             "use-olympus-account": "1",
             "version_code": "20800",
             "web_id": self._web_id or "",
+            "web_platform": "browser",
             "web_tab_id": str(uuid.uuid4()),
         }
-        if self._ms_token:
-            params["msToken"] = self._ms_token
+        # msToken is deliberately omitted: the page's own fetch hook injects a
+        # fresh one. Passing a stale copy here produces a duplicate parameter.
         return params
 
     def _build_headers(self, cookie_str: str, csrf_token: str = "") -> Dict[str, str]:
@@ -470,8 +551,18 @@ class BrowserClient:
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
+        chat_ability: Optional[Dict[str, Any]] = None,
+        leading_blocks: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Send a chat message and yield SSE events via in-browser fetch."""
+        """Send a chat message and yield SSE events via in-browser fetch.
+
+        chat_ability carries a skill invocation (e.g. video generation). The web
+        client leaves the chat mode descriptors empty when one is present, so we
+        do the same.
+
+        leading_blocks are sent as their own message ahead of the text one; the
+        web client attaches images that way rather than mixing blocks.
+        """
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
 
@@ -511,14 +602,18 @@ class BrowserClient:
                 "collect_id": "",
                 "is_audio": False,
                 "answer_with_suggest": False,
+                "agent_mode": AGENT_MODE,
                 "tts_switch": False,
                 "need_deep_think": use_deep_think,
                 "click_clear_context": False,
                 "from_suggest": False,
                 "is_regen": False,
                 "is_replace": False,
+                "is_from_click_option": False,
+                "is_from_click_softlink": False,
                 "disable_sse_cache": False,
                 "select_text_action": "",
+                "is_select_text": False,
                 "resend_for_regen": False,
                 "scene_type": 0,
                 "unique_key": str(uuid.uuid4()),
@@ -533,25 +628,77 @@ class BrowserClient:
                 "shared_app_id": "",
                 "sse_recv_event_options": {"support_chunk_delta": True},
                 "is_ai_playground": False,
+                "is_old_user": True,
                 "recovery_option": {
                     "is_recovery": False,
                     "req_create_time_sec": now_sec,
                     "append_sse_event_scene": 0,
                 },
                 "message_storage_type": 0,
+                "related_deleted_message_ids": {},
+                "connector_info_list": [],
+                "model_config": {
+                    "model_item_key": "" if chat_ability else MODEL_ITEM_KEY,
+                    "model_extra_params": {},
+                } if chat_ability else {
+                    "model_item_key": MODEL_ITEM_KEY,
+                    "model_extra_params": {},
+                    "reasoning_effort": REASONING_EFFORT,
+                },
+                "aggregate_params": {
+                    "conversation_mode": str(CONVERSATION_MODE),
+                    "mode_id": "" if chat_ability else MODE_ID,
+                    "model_item_key": "" if chat_ability else MODEL_ITEM_KEY,
+                    "agent_mode": "" if chat_ability else str(AGENT_MODE),
+                    "reasoning_effort": "" if chat_ability else str(REASONING_EFFORT),
+                    "provider_id": "",
+                },
+                "conversation_mode": CONVERSATION_MODE,
             },
             "ext": {
-                "use_deep_think": str(use_deep_think),
-                "fp": self._fp or "",
-                "collection_id": "",
-                "commerce_credit_config_enable": "0",
                 "sub_conv_firstmet_type": "1" if need_create else "0",
+                "collection_id": "",
+                "is_finish": "1",
+                "commerce_credit_config_enable": "0",
             },
         }
+        payload["user_context"] = []
+        if leading_blocks:
+            # Attachments travel as their own message, ahead of the text one.
+            payload["messages"].insert(0, {
+                "local_message_id": str(uuid.uuid1()),
+                "content_block": leading_blocks,
+                "message_status": 0,
+            })
+        if chat_ability:
+            payload["chat_ability"] = chat_ability
+            payload["ext"]["answer_with_suggest"] = "0"
+            # Skill requests carry no chat mode at all.
+            payload["option"].pop("agent_mode", None)
+            if leading_blocks:
+                # The web client tags attachment-bearing skill messages.
+                collect_id = str(uuid.uuid4())
+                payload["option"]["collect_id"] = collect_id
+                payload["ext"]["collection_id"] = collect_id
+        else:
+            payload["ext"]["use_deep_think"] = str(use_deep_think)
+        if need_create:
+            init_option = {"need_ack_conversation": True}
+            payload["option"]["conversation_init_option"] = init_option
+            payload["ext"]["conversation_init_option"] = json.dumps(
+                init_option, separators=(",", ":")
+            )
+            # conversation_init_ext carries the chat mode; skill requests omit it.
+            if not chat_ability:
+                payload["option"]["conversation_init_ext"] = {
+                    "model_item_key": MODEL_ITEM_KEY,
+                    "reasoning_effort": str(REASONING_EFFORT),
+                    "mode_id": MODE_ID,
+                }
 
         # Build URL with query params (fetch hook will add a_bogus/msToken)
         query_params = self._build_query_params()
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        query_string = urlencode(sorted(query_params.items()))
         url = f"/chat/completion?{query_string}"
 
         request_id = f"req_{uuid.uuid4().hex[:16]}"
@@ -611,15 +758,17 @@ class BrowserClient:
         js_code = """
         async ([url, payloadJson, requestId]) => {
             try {
-                const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
-                const csrfToken = csrf ? csrf[1] : '';
+                // Mirror the real web client exactly: it sends no csrf header here.
+                const hex = (n) => Array.from(
+                    crypto.getRandomValues(new Uint8Array(n)),
+                    (b) => b.toString(16).padStart(2, '0')
+                ).join('');
                 const headers = {
                     'Content-Type': 'application/json',
-                    'agw-js-conv': 'str',
+                    'Agw-Js-Conv': 'str',
+                    'x-flow-trace': `04-${hex(16)}-${hex(8)}-01`,
+                    'last-event-id': 'undefined',
                 };
-                if (csrfToken) {
-                    headers['x-tt-passport-csrf-token'] = csrfToken;
-                }
                 const res = await fetch(url, {
                     method: 'POST',
                     headers: headers,
@@ -782,7 +931,7 @@ class BrowserClient:
             raise RuntimeError("Browser not ready - need login first")
 
         query_params = self._build_query_params()
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        query_string = urlencode(sorted(query_params.items()))
         url = f"/samantha/chat/completion?{query_string}"
 
         js_code = """
@@ -846,6 +995,158 @@ class BrowserClient:
             except json.JSONDecodeError:
                 pass
         return body
+
+    async def _im_request(
+        self, path: str, body: Dict[str, Any], timeout: float = 30
+    ) -> Dict[str, Any]:
+        """POST to an /im/* endpoint via in-browser fetch and return parsed JSON."""
+        if not self._ready:
+            raise RuntimeError("Browser not ready - need login first")
+
+        query_string = urlencode(sorted(self._build_query_params().items()))
+        url = f"{path}?{query_string}"
+
+        js_code = """
+        async ([url, payloadJson, timeoutMs]) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json, text/plain, */*',
+                        // Plain application/json is rejected with 712012002.
+                        'Content-Type': 'application/json; encoding=utf-8',
+                        'Agw-Js-Conv': 'str',
+                    },
+                    body: payloadJson,
+                    credentials: 'include',
+                    signal: controller.signal,
+                });
+                clearTimeout(timer);
+                const text = await res.text();
+                return {ok: res.ok, status: res.status, body: text};
+            } catch (e) {
+                clearTimeout(timer);
+                return {ok: false, status: 0, body: e.message};
+            }
+        }
+        """
+        result = await self._page.evaluate(
+            js_code,
+            [url, json.dumps(body, ensure_ascii=False), int(timeout * 1000)],
+        )
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"{path} failed ({result.get('status')}): {result.get('body', '')[:300]}"
+            )
+        try:
+            data = json.loads(result.get("body", ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{path}: invalid JSON response") from exc
+
+        # These endpoints answer HTTP 200 even when they reject the request.
+        status_code = data.get("status_code", 0)
+        if status_code:
+            raise RuntimeError(
+                f"{path}: status_code={status_code} {data.get('status_desc', '')}"
+            )
+        return data
+
+    async def _pull_conversation_messages(
+        self, conversation_id: str, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Fetch the most recent messages of a conversation (newest first)."""
+        data = await self._im_request("/im/chain/single", {
+            "cmd": 3100,
+            "uplink_body": {
+                # Endpoint name misspells "single"; keep it as the server expects.
+                "pull_singe_chain_uplink_body": {
+                    "conversation_id": conversation_id,
+                    "anchor_index": 9007199254740991,
+                    "conversation_type": 3,
+                    "direction": 1,
+                    "limit": limit,
+                    "ext": {},
+                    "filter": {"index_list": []},
+                    "evaluate_ab_params": "",
+                    "evaluate_common_params": "",
+                },
+            },
+            "sequence_id": str(uuid.uuid4()),
+            "channel": 2,
+            "version": "1",
+        })
+        body = data.get("downlink_body", {}).get(
+            "pull_singe_chain_downlink_body", {}
+        )
+        return body.get("messages", []) or []
+
+    @staticmethod
+    def _normalize_video(video: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten a Doubao video object into our response shape."""
+        cover = video.get("cover_image") or video.get("cover") or {}
+        # The two carriers spell the preview key differently.
+        preview = cover.get("preview_img") or cover.get("image_preview") or {}
+        thumb = cover.get("image_thumb") or {}
+        return {
+            "vid": video.get("vid", ""),
+            "video_url": video.get("download_url", ""),
+            "cover_url": preview.get("url") or thumb.get("url", ""),
+            "duration": video.get("duration", 0),
+            "video_type": video.get("video_type", ""),
+            "width": preview.get("width") or video.get("width", ""),
+            "height": preview.get("height") or video.get("height", ""),
+        }
+
+    @classmethod
+    def _extract_videos(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collect finished videos from a conversation history page.
+
+        Doubao exposes a generated video through either of two carriers, so we
+        check both:
+        - ext.creation_material_info: a JSON string keyed by material id
+        - content_block[block_type=2074].content.creation_block.creations[]
+        """
+        videos = []
+
+        for msg in messages:
+            raw = (msg.get("ext") or {}).get("creation_material_info")
+            if not raw:
+                continue
+            try:
+                materials = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for material in (materials or {}).values():
+                result = material.get("result") or {}
+                if result.get("object_type") != CREATION_TYPE_VIDEO:
+                    continue
+                video = result.get("video") or {}
+                if video.get("download_url"):
+                    videos.append(cls._normalize_video(video))
+
+        for msg in messages:
+            for block in msg.get("content_block", []) or []:
+                if block.get("block_type") != CREATION_BLOCK_TYPE:
+                    continue
+                content = block.get("content", {}) or {}
+                creations = content.get("creation_block", {}).get("creations", []) or []
+                for creation in creations:
+                    if creation.get("type") != CREATION_TYPE_VIDEO:
+                        continue
+                    video = creation.get("video") or {}
+                    if video.get("status") == VIDEO_STATUS_DONE and video.get("download_url"):
+                        videos.append(cls._normalize_video(video))
+
+        # The same video can appear in both carriers.
+        seen, unique = set(), []
+        for v in videos:
+            if v["vid"] in seen:
+                continue
+            seen.add(v["vid"])
+            unique.append(v)
+        return unique
 
     @staticmethod
     def _parse_samantha_sse(raw: str) -> List[Dict[str, Any]]:
@@ -1144,198 +1445,172 @@ class BrowserClient:
         self,
         prompt: str,
         ratio: Optional[str] = None,
+        duration: int = 10,
+        model: Optional[str] = None,
+        ref_image: Optional[Dict[str, Any]] = None,
+        timeout: float = 480,
+        poll_interval: float = 10,
     ) -> Dict[str, Any]:
-        """Generate video using /samantha/chat/completion (async 2-step).
+        """Generate a video via the chat endpoint's video ability.
+
+        Doubao submits the job on /chat/completion (chat_ability.ability_type=17).
+        That SSE closes within seconds without carrying the result; the finished
+        video only shows up later as a creation block in the conversation, so we
+        poll the history endpoint until it appears.
 
         Args:
             prompt: Text description of the video to generate.
-            ratio: Aspect ratio ("16:9", "9:16", "1:1").
+            ratio: Aspect ratio ("16:9", "9:16", "1:1"); "auto" when omitted.
+            duration: Requested length in seconds.
+            model: Doubao's internal video model id; defaults to VIDEO_MODEL.
+                Only "seedance_v2.0" has been observed in the web client.
+            ref_image: Reference image for image-to-video, as returned by
+                upload_image(): {"uri": ..., "name": ..., "width": ..., "height": ...}.
+            timeout: Give up after this many seconds.
+            poll_interval: Seconds between history polls.
 
         Returns:
             Dict with 'videos' list, each having video_url/cover_url/duration.
         """
-        import base64
-
-        content_data: Dict[str, Any] = {"text": prompt}
-        if ratio:
-            content_data["ratio"] = ratio
-
-        message: Dict[str, Any] = {
-            "content": json.dumps(content_data, ensure_ascii=False),
-            "content_type": 2020,
-            "attachments": [],
-            "references": [],
-            "skill": {
-                "skill_type": 17,
-                "skill_type_no_default": 17,
-                "skill_id": "17",
-                "skill_id_no_default": "17",
+        ability_param = {
+            "ratio": ratio or "auto",
+            "model": model or VIDEO_MODEL,
+            "duration": duration,
+            "input_box_content": {
+                "user_input_content": prompt,
+                "reply_message_format": "生成视频：%s",
             },
         }
-
-        payload = {
-            "messages": [message],
-            "completion_option": {
-                "is_regen": False,
-                "with_suggest": True,
-                "need_create_conversation": True,
-                "launch_stage": 1,
-                "is_replace": False,
-                "is_delete": False,
-                "is_ai_playground": False,
-                "memory_type": 2,
-                "message_from": 0,
-                "use_deep_think": False,
-                "use_auto_cot": False,
-                "resend_for_regen": False,
-                "enable_commerce_credit": False,
-                "action_bar_skill_id": 17,
-            },
-            "evaluate_option": {"web_ab_params": ""},
-            "local_conversation_id": str(uuid.uuid4()),
-            "local_message_id": str(uuid.uuid4()),
+        chat_ability = {
+            "ability_type": VIDEO_ABILITY_TYPE,
+            "ability_param": json.dumps(ability_param, ensure_ascii=False),
         }
+        # The web client sends the formatted text, not the raw prompt.
+        display_text = f"生成视频：{prompt}，{duration}s"
 
-        log.info("generate_video: prompt=%s, ratio=%s", prompt[:50], ratio)
-        raw = await self._samantha_request(payload, timeout=60)
+        # With a reference image the web client sends only the attachment block;
+        # the prompt travels in chat_ability instead of a text block.
+        leading_blocks = None
+        if ref_image:
+            leading_blocks = [{
+                "block_type": ATTACHMENT_BLOCK_TYPE,
+                "content": {
+                    "attachment_block": {
+                        "attachments": [{
+                            "type": ATTACHMENT_TYPE_IMAGE,
+                            # Must match the identifier registered via
+                            # pre_handle_v2_without_conv.
+                            "identifier": ref_image.get("identifier") or str(uuid.uuid1()),
+                            "image": {
+                                "name": ref_image.get("name") or "image.png",
+                                "uri": ref_image["uri"],
+                                "image_ori": {
+                                    "url": "",
+                                    "width": int(ref_image.get("width") or 0),
+                                    "height": int(ref_image.get("height") or 0),
+                                    "format": "",
+                                    "url_formats": {},
+                                },
+                            },
+                            "parse_state": 0,
+                            "review_state": 1,
+                            "upload_status": 1,
+                            "progress": 100,
+                            "src": "",
+                        }],
+                    },
+                    "pc_event_block": "",
+                },
+                "block_id": str(uuid.uuid4()),
+                "parent_id": "",
+                "meta_info": [],
+                "append_fields": [],
+            }]
 
-        # Phase 1: Extract async task_id from fin_reason
-        task_id = None
+        log.info("generate_video: prompt=%s, ratio=%s, duration=%s, model=%s, ref_image=%s",
+                 prompt[:50], ratio, duration, ability_param["model"],
+                 bool(ref_image))
+
+        conversation_id = None
         text_parts = []
-        for data in self._parse_samantha_sse(raw):
-            et = data.get("event_type")
-            if et == 2005:
-                detail = data.get("event_data", "")
-                raise RuntimeError(f"generate_video error: {str(detail)[:500]}")
-            if et != 2001:
-                continue
-
-            ed = data.get("event_data", {})
-            if isinstance(ed, str):
-                try:
-                    ed = json.loads(ed)
-                except json.JSONDecodeError:
-                    continue
-
-            # Check for async task
-            fin_reason = ed.get("fin_reason", {})
-            if fin_reason and fin_reason.get("reason") == 1:
-                async_task = fin_reason.get("async_task", {})
-                task_id = async_task.get("id", "")
-
-            # Collect text for error messages
-            msg = ed.get("message", {})
-            if isinstance(msg, str):
-                try:
-                    msg = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
-            if msg.get("content_type") == 2001:
-                content_raw = msg.get("content", "")
-                if isinstance(content_raw, str):
-                    try:
-                        c = json.loads(content_raw)
-                        text_parts.append(c.get("text", ""))
-                    except json.JSONDecodeError:
-                        pass
+        async for event in self.chat_completion(
+            display_text, chat_ability=chat_ability, leading_blocks=leading_blocks
+        ):
+            if event.get("error"):
+                raise RuntimeError(
+                    f"generate_video submit failed "
+                    f"({event.get('status')}): {event.get('body', '')[:300]}"
+                )
+            if event.get("error_code"):
+                raise RuntimeError(
+                    f"generate_video submit error code="
+                    f"{event.get('error_code')}: {event.get('error_msg', '')}"
+                )
+            if not conversation_id:
+                cid = self.extract_conversation_id(event)
+                if cid and cid != "0":
+                    conversation_id = cid
+            text_parts.append(self._extract_text(event))
 
         full_text = "".join(text_parts)
-        if "服务过载" in full_text or "重试" in full_text:
-            raise RuntimeError("视频生成服务过载，请稍后重试")
+        if not conversation_id:
+            raise RuntimeError(
+                f"generate_video: no conversation_id returned. reply={full_text[:300]}"
+            )
 
-        if not task_id:
-            # Maybe sync result with content_type=2021, or just text response
-            if full_text:
-                return {"videos": [], "prompt": prompt, "message": full_text}
-            raise RuntimeError("Video generation: no task_id returned")
-
-        # Phase 2: Poll for result
-        log.info("generate_video: polling task_id=%s", task_id)
-        return await self._poll_video_result(task_id, prompt)
+        log.info("generate_video: submitted, conversation_id=%s, polling history",
+                 conversation_id)
+        return await self._poll_video_result(
+            conversation_id, prompt, full_text, timeout, poll_interval
+        )
 
     async def _poll_video_result(
-        self, task_id: str, prompt: str, timeout: float = 300
+        self,
+        conversation_id: str,
+        prompt: str,
+        submit_text: str,
+        timeout: float,
+        poll_interval: float,
     ) -> Dict[str, Any]:
-        """Poll /samantha/chat/completion with task_id for video result."""
-        import base64
+        """Poll conversation history until the generated video is ready."""
+        deadline = time.time() + timeout
+        consecutive_errors = 0
 
-        poll_payload = {"task_id": task_id, "event_id": 0}
-        # Use _samantha_request which now uses browser fetch
-        raw = await self._samantha_request(poll_payload, timeout=timeout)
-
-        videos = []
-        for data in self._parse_samantha_sse(raw):
-            et = data.get("event_type")
-            if et != 2001:
+        while time.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                messages = await self._pull_conversation_messages(conversation_id)
+                consecutive_errors = 0
+            except RuntimeError as exc:
+                consecutive_errors += 1
+                log.warning("generate_video: history poll failed (%d): %s",
+                            consecutive_errors, exc)
+                if consecutive_errors >= 3:
+                    raise RuntimeError(
+                        f"generate_video: history polling unusable: {exc}"
+                    ) from exc
                 continue
 
-            ed = data.get("event_data", {})
-            if isinstance(ed, str):
-                try:
-                    ed = json.loads(ed)
-                except json.JSONDecodeError:
-                    continue
+            videos = self._extract_videos(messages)
+            if videos:
+                log.info("generate_video: got %d videos", len(videos))
+                return {
+                    "videos": videos,
+                    "prompt": prompt,
+                    "conversation_id": conversation_id,
+                }
 
-            msg = ed.get("message", {})
-            if isinstance(msg, str):
-                try:
-                    msg = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
+        raise RuntimeError(
+            f"generate_video: timed out after {timeout:.0f}s waiting for the "
+            f"video in conversation {conversation_id}. reply={submit_text[:200]}"
+        )
 
-            if msg.get("content_type") != 2021:
-                continue
-
-            content_raw = msg.get("content", "")
-            if isinstance(content_raw, str):
-                try:
-                    content = json.loads(content_raw)
-                except json.JSONDecodeError:
-                    continue
-            else:
-                content = content_raw
-
-            for item in content.get("data", [content]):
-                if not isinstance(item, dict):
-                    continue
-                video_url = item.get("video_url", "") or item.get("url", "")
-                if not video_url:
-                    vm_str = item.get("video_model", "")
-                    if vm_str:
-                        try:
-                            vm = json.loads(vm_str) if isinstance(vm_str, str) else vm_str
-                            vlist = vm.get("video_list", {})
-                            for _q, vinfo in vlist.items():
-                                main_b64 = vinfo.get("main_url", "")
-                                if main_b64:
-                                    video_url = base64.b64decode(main_b64).decode(
-                                        "utf-8", errors="replace"
-                                    )
-                                    break
-                        except (json.JSONDecodeError, Exception):
-                            pass
-
-                cover_url = item.get("cover_url", "") or item.get("cover", {}).get("url", "")
-                if video_url:
-                    videos.append({
-                        "video_url": video_url,
-                        "cover_url": cover_url,
-                        "width": item.get("width", 0),
-                        "height": item.get("height", 0),
-                        "duration": item.get("duration", 0.0),
-                    })
-
-        log.info("generate_video: got %d videos", len(videos))
-        return {"videos": videos, "prompt": prompt}
-
-    # ------------------------------------------------------------------
-    # File upload (TOS / ImageX flow)
-    # ------------------------------------------------------------------
 
     async def upload_file(
         self,
         file_data: bytes,
         filename: str,
+        resource_type: int = 1,
     ) -> Dict[str, Any]:
         """Upload a file to Doubao's storage (ByteDance TOS via ImageX proxy).
 
@@ -1344,6 +1619,10 @@ class BrowserClient:
           2. GET  /top/v1?Action=ApplyImageUpload -> upload address
           3. POST https://{tos_host}/upload/v1/{store_uri} -> upload binary
           4. POST /top/v1?Action=CommitImageUpload -> confirm
+
+        resource_type selects the storage service: 1 for documents, 2 for images
+        that will be attached to a message (the video ability only accepts the
+        latter's bucket).
 
         Returns:
             Dict with uri, name, size, file_type.
@@ -1371,7 +1650,7 @@ class BrowserClient:
         # Step 1: prepare_upload
         resp = await self._http.post(
             signed_url, headers=headers,
-            json={"tenant_id": "5", "scene_id": "5", "resource_type": 1},
+            json={"tenant_id": "5", "scene_id": "5", "resource_type": resource_type},
             timeout=30,
         )
         body = resp.json()
@@ -1510,6 +1789,102 @@ class BrowserClient:
         if not file_urls:
             raise RuntimeError("get_file_url returned no file_urls")
         return file_urls[0].get("main_url", "")
+
+    async def upload_ref_image(
+        self,
+        image_data: bytes,
+        filename: str,
+        bot_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Upload an image and register it for use as a message attachment.
+
+        The web client uploads to the image bucket (resource_type=2) and then
+        announces the result via pre_handle_v2_without_conv. The identifier used
+        there must be reused in the attachment block, otherwise the server
+        rejects the message.
+
+        Returns a dict ready to pass to generate_video(ref_image=...).
+        """
+        uploaded = await self.upload_file(
+            image_data, filename, resource_type=IMAGE_RESOURCE_TYPE
+        )
+        identifier = str(uuid.uuid1())
+        await self._alice_request(
+            "/alice/message/pre_handle_v2_without_conv",
+            {
+                "uplink_entity": {
+                    "entity_type": 2,
+                    "entity_content": {"image": {"key": uploaded["uri"]}},
+                    "identifier": identifier,
+                },
+                "bot_id": bot_id or DEFAULT_BOT_ID,
+                "local_message_id": str(uuid.uuid1()),
+            },
+        )
+        width, height = self._png_size(image_data)
+        return {
+            "uri": uploaded["uri"],
+            "name": uploaded["name"],
+            "identifier": identifier,
+            "width": width,
+            "height": height,
+        }
+
+    @staticmethod
+    def _png_size(data: bytes) -> tuple:
+        """Read (width, height) from a PNG header; (0, 0) for anything else."""
+        if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+            return struct.unpack(">II", data[16:24])
+        return (0, 0)
+
+    async def _alice_request(
+        self, path: str, body: Dict[str, Any], timeout: float = 30
+    ) -> Dict[str, Any]:
+        """POST to an /alice/* endpoint via in-browser fetch."""
+        if not self._ready:
+            raise RuntimeError("Browser not ready - need login first")
+
+        query_string = urlencode(sorted(self._build_query_params().items()))
+        js_code = """
+        async ([url, payloadJson, timeoutMs]) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json, text/plain, */*',
+                        'Content-Type': 'application/json',
+                        'Agw-Js-Conv': 'str',
+                    },
+                    body: payloadJson,
+                    credentials: 'include',
+                    signal: controller.signal,
+                });
+                clearTimeout(timer);
+                return {ok: res.ok, status: res.status, body: await res.text()};
+            } catch (e) {
+                clearTimeout(timer);
+                return {ok: false, status: 0, body: e.message};
+            }
+        }
+        """
+        result = await self._page.evaluate(
+            js_code,
+            [f"{path}?{query_string}", json.dumps(body, ensure_ascii=False),
+             int(timeout * 1000)],
+        )
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"{path} failed ({result.get('status')}): {result.get('body', '')[:300]}"
+            )
+        try:
+            data = json.loads(result.get("body", ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{path}: invalid JSON response") from exc
+        if data.get("code") != 0:
+            raise RuntimeError(f"{path}: code={data.get('code')} {data.get('msg', '')}")
+        return data
 
     async def upload_image(
         self,
@@ -1689,7 +2064,7 @@ class BrowserClient:
         }
 
         query_params = self._build_query_params()
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        query_string = urlencode(sorted(query_params.items()))
         url = f"/chat/completion?{query_string}"
 
         # Use browser fetch (non-streaming, collect full response)
