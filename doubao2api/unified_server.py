@@ -28,7 +28,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .browser_client import BrowserClient
+from .accounts import AccountPool
+from .browser_client import BrowserClient, QuotaExhaustedError
 from .qianwen_client import QianwenClient, QIANWEN_MODELS
 from .tool_calling import (
     build_tool_system_prompt,
@@ -228,6 +229,9 @@ def create_app(
 
     _browser: Dict[str, Any] = {}  # holds BrowserClient instance
     _qianwen: Dict[str, Any] = {}  # holds QianwenClient instance
+    _accounts = AccountPool()
+    # Serialize account switches: they mutate the shared browser session.
+    _switch_lock = asyncio.Lock()
 
     async def _browser_watchdog():
         """Background task: check browser health every 30s, auto-restart on crash."""
@@ -250,9 +254,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Ensure browser_client logs are visible
-        logging.getLogger("doubao2api.browser_client").setLevel(logging.INFO)
-        logging.getLogger("doubao2api.browser_client").addHandler(logging.StreamHandler())
+        # Ensure our own logs are visible, including account failover.
+        pkg_log = logging.getLogger("doubao2api")
+        pkg_log.setLevel(logging.INFO)
+        pkg_log.addHandler(logging.StreamHandler())
 
         # Start browser client
         headless = os.environ.get("DOUBAO_HEADLESS", "true").lower() == "true"
@@ -266,6 +271,13 @@ def create_app(
 
         if client.is_ready:
             log.info("Browser client ready (already logged in)")
+            # Passport will not list a profile's accounts, so the roster grows
+            # from whichever account is active each time we start.
+            try:
+                current = await client.current_account()
+                _accounts.remember(current["sec_user_id"], current["label"])
+            except RuntimeError as exc:
+                log.warning("Could not identify current account: %s", exc)
         else:
             log.warning(
                 "Browser not logged in. Visit /auth to scan QR code."
@@ -1055,6 +1067,79 @@ def create_app(
         key = body.get("ref_image_key")
         return {"uri": key} if key else None
 
+    async def _generate_video_failover(
+        client: BrowserClient, kwargs: dict
+    ) -> dict:
+        """Generate a video, rolling to another account when quota runs out.
+
+        Each account's free video quota resets daily, so an exhausted one is
+        parked for the day rather than retried. Accounts must already be logged
+        into the browser profile; this only re-points the session at one.
+        """
+        while True:
+            try:
+                return await client.generate_video(**kwargs)
+            except QuotaExhaustedError as exc:
+                async with _switch_lock:
+                    try:
+                        current = await client.current_account()
+                    except RuntimeError:
+                        raise exc
+                    _accounts.mark_exhausted(current["sec_user_id"])
+                    candidates = _accounts.candidates(
+                        exclude=current["sec_user_id"]
+                    )
+                    if not candidates:
+                        log.warning("video: no accounts left with quota today")
+                        raise exc
+                    nxt = candidates[0]
+                    log.info("video: quota exhausted on %s, switching to %s",
+                             current["label"], nxt.get("label") or "?")
+                    try:
+                        switched = await client.switch_account(
+                            nxt["sec_user_id"]
+                        )
+                    except RuntimeError as sw_exc:
+                        raise RuntimeError(
+                            f"quota exhausted and switch failed: {sw_exc}"
+                        ) from exc
+                    _accounts.remember(
+                        switched["sec_user_id"], switched["label"]
+                    )
+
+    @app.get("/admin/api/accounts")
+    async def admin_accounts(request: Request):
+        """List the known accounts and which one is active."""
+        _check_auth(request)
+        client = _browser.get("client")
+        current = ""
+        if client is not None and client.is_ready:
+            try:
+                current = (await client.current_account())["sec_user_id"]
+            except RuntimeError as exc:
+                log.warning("admin_accounts: %s", exc)
+        return JSONResponse({
+            "current": current,
+            "accounts": _accounts.all(),
+        })
+
+    @app.post("/admin/api/accounts/switch")
+    async def admin_accounts_switch(request: Request):
+        """Switch the browser session to another logged-in account."""
+        _check_auth(request)
+        client = _get_client()
+        body = await request.json()
+        sec_user_id = body.get("sec_user_id", "")
+        if not sec_user_id:
+            raise HTTPException(status_code=400, detail="Missing sec_user_id")
+        async with _switch_lock:
+            try:
+                account = await client.switch_account(sec_user_id)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+            _accounts.remember(account["sec_user_id"], account["label"])
+        return JSONResponse(account)
+
     @app.post("/v1/video/generations")
     async def video_generations(request: Request):
         _check_auth(request)
@@ -1070,15 +1155,18 @@ def create_app(
         if ratio and "x" in str(ratio):
             ratio = _size_to_ratio(ratio)
 
+        kwargs = dict(
+            prompt=prompt, ratio=ratio,
+            duration=int(body.get("duration") or 10),
+            # "model" here is the OpenAI-style alias (doubao-video); the
+            # internal Doubao model id goes in "video_model".
+            model=body.get("video_model") or None,
+            ref_image=_video_ref_image(body),
+        )
         try:
-            result = await client.generate_video(
-                prompt=prompt, ratio=ratio,
-                duration=int(body.get("duration") or 10),
-                # "model" here is the OpenAI-style alias (doubao-video); the
-                # internal Doubao model id goes in "video_model".
-                model=body.get("video_model") or None,
-                ref_image=_video_ref_image(body),
-            )
+            result = await _generate_video_failover(client, kwargs)
+        except QuotaExhaustedError as exc:
+            raise HTTPException(status_code=429, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 

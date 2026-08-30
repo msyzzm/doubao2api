@@ -45,10 +45,14 @@
     - [POST /v1/images/generations](#post-v1imagesgenerations)
     - [POST /v1/video/ref_image](#post-v1videoref_image)
     - [POST /v1/video/generations](#post-v1videogenerations)
+      - [无水印视频](#无水印视频)
+      - [额度耗尽自动换号](#额度耗尽自动换号)
     - [POST /v1/audio/generations](#post-v1audiogenerations)
     - [GET /auth/status](#get-authstatus)
     - [POST /v1/session/qr-login](#post-v1sessionqr-login)
     - [GET /admin](#get-admin)
+    - [GET /admin/api/accounts](#get-adminapiaccounts)
+    - [POST /admin/api/accounts/switch](#post-adminapiaccountsswitch)
   - [使用 OpenAI Python SDK](#使用-openai-python-sdk)
   - [使用 curl](#使用-curl)
 - [Bot ID](#bot-id)
@@ -1696,24 +1700,66 @@ curl -X POST http://localhost:9090/v1/video/generations \
   "data": [
     {
       "vid": "v0369cg10004daa0ndq7dld6spihm76g",
-      "video_url": "https://v3-default.douyin.com/...&download=true",
+      "video_url": "https://v9-default.douyin.com/...&lr=unwatermarked",
+      "video_url_watermarked": "https://v6-default.douyin.com/...&lr=video_gen_watermark_dyn",
       "cover_url": "https://p11-flow-imagex-sign.byteimg.com/...",
       "duration": 4.065,
       "video_type": "mp4",
-      "width": 720,
-      "height": 1280
+      "width": 1280,
+      "height": 720
     }
   ]
 }
 ```
+
+`video_url` 默认为**无水印**版本，见 [无水印视频](#无水印视频)。若解析失败则回退为带水印地址，
+此时不会返回 `video_url_watermarked` 字段。两者都是带签名的临时链接，需尽快下载。
 
 **错误码**：
 
 | HTTP 状态 | 说明 |
 |-----------|------|
 | 400 | 缺少 `prompt` |
+| 429 | 所有账号今日免费额度均已用完 |
 | 503 | 未登录、浏览器未初始化或需要验证码 |
 | 502 | 提交被拒、轮询失败或等待超时 |
+
+##### 无水印视频
+
+创作块里的 `download_url` 带水印（`lr=video_gen_watermark_dyn`，画面右下角「豆包AI生成」），
+但同一个块的 `video_model` 里含 `fallback_api`。用 `channel=no&codec_type=8&logo_type=unwatermarked`
+重新请求该接口，即可拿到干净且码率更高的版本；其 `main_url` 不是普通 base64，而是用
+`key_seed` 派生密钥的 AES-CBC 密文，需解密后才是可下载地址。
+
+实测同一条 4 秒视频：带水印 423 KB / 384×216，无水印 2.05 MB / 1280×720。
+
+该逻辑在 `doubao2api/unwatermark.py`，移植自 [ai-media-extractor](https://github.com/Hmily/ai-media-extractor)（MIT）。
+依赖 `cryptography`；缺失时自动降级为带水印地址。
+
+##### 额度耗尽自动换号
+
+免费账号每天约 10 次视频生成。额度用完时豆包不会返回错误码，而是回一条正常的助手消息
+（「今日视频生成免费次数用完了……」），唯一可判定的结构化标记是该消息 `ext.inner_paywall_cta_param`——
+成功的生成从不带这个字段。
+
+检测到该标记后，服务端会把当前账号按日期标记为已耗尽，切换到浏览器 profile 里另一个
+已登录账号并**自动重试一次**，全程无需刷新页面。设备指纹（`device_id`/`web_id`/`fp`）是设备级的，
+切号后不变，因此不会触发风控。所有账号都用完时返回 429。
+
+账号名单存于 `.doubao_accounts.json`（可用 `DOUBAO_ACCOUNTS_FILE` 覆盖）：
+
+```json
+[
+  {"sec_user_id": "MS4wLjABAAAA...", "label": "用户324827"},
+  {"sec_user_id": "MS4wLjABAAAA...", "label": "用户692853", "exhausted_on": "2026-08-30"}
+]
+```
+
+> 豆包的 aid 无权调用 passport 的账号列表接口（`error_code 16`），只能查到**当前**账号，
+> 所以名单需要手工补齐：在浏览器里切一次号，再调 `GET /admin/api/accounts` 拿到 `sec_user_id`。
+> 服务启动和每次切号时会自动把当前账号补进名单。
+>
+> 只能切换**已经登录到该 browser profile** 的账号，本功能不会替你登录新账号。
 
 > 提交被豆包拒绝时（回复类似「出了点问题，请稍后重试」），当前实现仍会轮询到超时才报错，
 > 而不是立即失败。
@@ -1825,6 +1871,25 @@ curl -X POST http://localhost:9090/v1/video/generations \
 #### GET /admin/api/cookies
 
 当前 session 的 Cookie 详情。
+
+#### GET /admin/api/accounts
+
+列出已知账号和当前激活账号。
+
+```json
+{
+  "current": "MS4wLjABAAAA...",
+  "accounts": [
+    {"sec_user_id": "MS4wLjABAAAA...", "label": "用户324827"},
+    {"sec_user_id": "MS4wLjABAAAA...", "label": "用户692853", "exhausted_on": "2026-08-30"}
+  ]
+}
+```
+
+#### POST /admin/api/accounts/switch
+
+切换到 profile 内另一个已登录账号。请求体 `{"sec_user_id": "MS4wLjABAAAA..."}`，
+返回切换后的账号信息。视频生成的额度失败会自动调用它，一般无需手动触发。
 
 ### 使用 OpenAI Python SDK
 

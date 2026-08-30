@@ -24,6 +24,7 @@ venv/
 .idea/
 
 # Generated artifacts
+out/
 doubao_qr_login.png
 server_out.txt
 server_err.txt
@@ -33,3 +34,6 @@ testpic.webp
 # OS
 Thumbs.db
 .DS_Store
+
+# Account roster (passport ids)
+.doubao_accounts.json

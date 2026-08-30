@@ -27,6 +27,8 @@ import httpx
 from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
 
+from .unwatermark import resolve_unwatermarked
+
 log = logging.getLogger(__name__)
 
 DOUBAO_URL = "https://www.doubao.com"
@@ -97,13 +99,28 @@ VIDEO_STATUS_DONE = 3
 VIDEO_ABILITY_TYPE = 17
 VIDEO_MODEL = "seedance_v2.0"
 ATTACHMENT_BLOCK_TYPE = 10052
+TEXT_BLOCK_TYPE = 10000
 ATTACHMENT_TYPE_IMAGE = 1
+# Only present on a reply that was refused for lack of quota; successful
+# generations never carry it.
+PAYWALL_EXT_KEY = "inner_paywall_cta_param"
+PASSPORT_INFO_PATH = "/passport/account/info/v2/?account_sdk_source=web"
+PASSPORT_SWITCH_PATH = "/passport/web/account/switch/"
 # prepare_upload resource_type: 1 = documents, 2 = message images.
 IMAGE_RESOURCE_TYPE = 2
 CONVERSATION_MODE = 1
 MODE_ID = "1"
 MODEL_ITEM_KEY = "0"
 REASONING_EFFORT = 3
+
+
+class QuotaExhaustedError(RuntimeError):
+    """Doubao refused the request because the account's free quota is used up."""
+
+    def __init__(self, message: str, feature_key: str = "", reset_period: int = 0):
+        super().__init__(message)
+        self.feature_key = feature_key
+        self.reset_period = reset_period
 
 
 class BrowserClient:
@@ -1097,6 +1114,9 @@ class BrowserClient:
             "video_type": video.get("video_type", ""),
             "width": preview.get("width") or video.get("width", ""),
             "height": preview.get("height") or video.get("height", ""),
+            # Carries fallback_api/key_seed; consumed by _add_unwatermarked
+            # and stripped before the video reaches the caller.
+            "_video_model": video.get("video_model", ""),
         }
 
     @classmethod
@@ -1147,6 +1167,43 @@ class BrowserClient:
             seen.add(v["vid"])
             unique.append(v)
         return unique
+
+    @staticmethod
+    def _message_text(msg: Dict[str, Any]) -> str:
+        """First text block of a message, or ''."""
+        for block in msg.get("content_block", []) or []:
+            if block.get("block_type") != TEXT_BLOCK_TYPE:
+                continue
+            text_block = (block.get("content") or {}).get("text_block") or {}
+            return text_block.get("text", "")
+        return ""
+
+    @classmethod
+    def _detect_quota_block(
+        cls, messages: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Return quota-refusal details, or None if no refusal is present.
+
+        A quota refusal looks like an ordinary finished assistant reply, so
+        neither the text nor is_finish can tell it apart from a generation
+        still in flight. The one structured marker is ext.inner_paywall_cta_param,
+        whose snapshot carries feature_key and unavailable_reason.
+        """
+        for msg in messages:
+            raw = (msg.get("ext") or {}).get(PAYWALL_EXT_KEY)
+            if not raw:
+                continue
+            try:
+                snapshot = json.loads(json.loads(raw).get("snapshot") or "{}")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                snapshot = {}
+            reason = snapshot.get("unavailable_reason") or {}
+            return {
+                "text": cls._message_text(msg),
+                "feature_key": snapshot.get("feature_key", ""),
+                "reset_period": reason.get("reset_period", 0),
+            }
+        return None
 
     @staticmethod
     def _parse_samantha_sse(raw: str) -> List[Dict[str, Any]]:
@@ -1564,6 +1621,26 @@ class BrowserClient:
             conversation_id, prompt, full_text, timeout, poll_interval
         )
 
+    @staticmethod
+    async def _add_unwatermarked(videos: List[Dict[str, Any]]) -> None:
+        """Swap in the watermark-free rendition, in place.
+
+        The stamped URL is kept under video_url_watermarked so a failed
+        resolution still leaves the caller with a downloadable video.
+        """
+        for video in videos:
+            video_model = video.pop("_video_model", "")
+            clean = await resolve_unwatermarked(video_model)
+            if not clean:
+                continue
+            video["video_url_watermarked"] = video["video_url"]
+            video["video_url"] = clean["url"]
+            if clean["width"] and clean["height"]:
+                video["width"] = clean["width"]
+                video["height"] = clean["height"]
+            log.info("generate_video: unwatermarked %s (%s)",
+                     video.get("vid", ""), clean["definition"])
+
     async def _poll_video_result(
         self,
         conversation_id: str,
@@ -1575,6 +1652,7 @@ class BrowserClient:
         """Poll conversation history until the generated video is ready."""
         deadline = time.time() + timeout
         consecutive_errors = 0
+        last_reply = submit_text
 
         while time.time() < deadline:
             await asyncio.sleep(poll_interval)
@@ -1594,15 +1672,32 @@ class BrowserClient:
             videos = self._extract_videos(messages)
             if videos:
                 log.info("generate_video: got %d videos", len(videos))
+                await self._add_unwatermarked(videos)
                 return {
                     "videos": videos,
                     "prompt": prompt,
                     "conversation_id": conversation_id,
                 }
 
+            # No point waiting out the timeout once Doubao has said no.
+            quota = self._detect_quota_block(messages)
+            if quota:
+                raise QuotaExhaustedError(
+                    f"generate_video: quota exhausted: "
+                    f"{quota['text'] or '(no reply text)'}",
+                    feature_key=quota["feature_key"],
+                    reset_period=quota["reset_period"],
+                )
+
+            for msg in messages:
+                text = self._message_text(msg)
+                if text:
+                    last_reply = text
+                    break
+
         raise RuntimeError(
             f"generate_video: timed out after {timeout:.0f}s waiting for the "
-            f"video in conversation {conversation_id}. reply={submit_text[:200]}"
+            f"video in conversation {conversation_id}. reply={last_reply[:200]}"
         )
 
 
@@ -1885,6 +1980,117 @@ class BrowserClient:
         if data.get("code") != 0:
             raise RuntimeError(f"{path}: code={data.get('code')} {data.get('msg', '')}")
         return data
+
+    # ------------------------------------------------------------------
+    # Accounts
+    # ------------------------------------------------------------------
+
+    async def _passport_request(
+        self,
+        path: str,
+        method: str = "GET",
+        form_body: str = "",
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        """Call a /passport/* endpoint via in-browser fetch.
+
+        Passport needs the CSRF header that the chat endpoints must not carry,
+        and answers HTTP 200 with the failure in the body.
+        """
+        if not self._page:
+            raise RuntimeError("Browser not started")
+
+        csrf = await self._get_csrf_token()
+        js_code = """
+        async ([url, method, formBody, csrf, timeoutMs]) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const init = {
+                    method: method,
+                    credentials: 'include',
+                    signal: controller.signal,
+                    headers: {
+                        'Accept': 'application/json, text/plain, */*',
+                        'x-tt-passport-csrf-token': csrf,
+                    },
+                };
+                if (method === 'POST') {
+                    init.headers['Content-Type'] =
+                        'application/x-www-form-urlencoded';
+                    init.body = formBody;
+                }
+                const res = await fetch(url, init);
+                clearTimeout(timer);
+                return {status: res.status, body: await res.text()};
+            } catch (e) {
+                clearTimeout(timer);
+                return {status: 0, body: e.message};
+            }
+        }
+        """
+        result = await self._page.evaluate(
+            js_code, [path, method, form_body, csrf, int(timeout * 1000)]
+        )
+        try:
+            data = json.loads(result.get("body", ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"{path}: non-JSON response ({result.get('status')}): "
+                f"{result.get('body', '')[:200]}"
+            ) from exc
+        if data.get("message") == "error":
+            err = data.get("data") or {}
+            raise RuntimeError(
+                f"{path}: error_code={err.get('error_code')} "
+                f"{err.get('description', '')}"
+            )
+        return data
+
+    async def current_account(self) -> Dict[str, str]:
+        """Identify the account the browser session is currently signed in as."""
+        data = (await self._passport_request(PASSPORT_INFO_PATH)).get("data") or {}
+        return {
+            "sec_user_id": data.get("sec_user_id", ""),
+            "user_id": data.get("user_id_str", ""),
+            "label": data.get("screen_name", ""),
+        }
+
+    async def switch_account(self, sec_user_id: str) -> Dict[str, str]:
+        """Switch to another account already logged into this browser profile.
+
+        Only accounts present in the profile's account menu can be reached;
+        passport will not create a session for an unknown user. The device
+        fingerprint (device_id/web_id/fp) is device-scoped and survives the
+        switch, so no re-extraction is needed.
+        """
+        if not sec_user_id:
+            raise RuntimeError("switch_account: missing sec_user_id")
+
+        # p_ca is sent empty by the web client; ts is seconds.
+        query = urlencode({
+            "passport_jssdk_version": "4.1.5",
+            "passport_jssdk_type": "normal",
+            "is_from_ttaccountsdk": "1",
+            "aid": "497858",
+            "language": "zh",
+            "account_app_language": "zh-CN",
+            "ts": str(int(time.time())),
+            "p_ca": "",
+        })
+        data = (await self._passport_request(
+            f"{PASSPORT_SWITCH_PATH}?{query}",
+            method="POST",
+            form_body=urlencode({"sec_to_user_id": sec_user_id}),
+        )).get("data") or {}
+        account = {
+            "sec_user_id": data.get("sec_user_id", sec_user_id),
+            "user_id": data.get("user_id_str", ""),
+            "label": data.get("screen_name", ""),
+        }
+        log.info("switch_account: now %s (%s)",
+                 account["label"], account["user_id"])
+        return account
 
     async def upload_image(
         self,
