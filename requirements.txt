@@ -1,7 +1,19 @@
 # Core dependencies
 aiohttp>=3.9
-# AES-CBC decryption of the unwatermarked video main_url
-cryptography>=42.0
 fastapi>=0.100
+# Direct HTTP for file upload (TOS/ImageX) and the unwatermarked fallback_api
+httpx>=0.24
 pydantic>=2.0
 uvicorn>=0.20
+
+# Browser session. Needs the Chromium binary too, which pip does not install:
+#   playwright install chromium
+playwright>=1.40
+playwright-stealth>=2.0
+
+# Imported lazily, each with a working fallback, so the server still starts
+# without them — it just quietly loses the feature.
+#   cryptography: without it, video URLs stay watermarked
+#   tiktoken:     without it, token counting falls back to a char estimate
+cryptography>=42.0
+tiktoken>=0.5
