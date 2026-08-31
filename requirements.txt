@@ -5,6 +5,9 @@ fastapi>=0.100
 httpx>=0.24
 pydantic>=2.0
 uvicorn>=0.20
+# Never imported by this package, but Starlette's request.form() asserts on it,
+# so every multipart endpoint 500s without it.
+python-multipart>=0.0.7
 
 # Browser session. Needs the Chromium binary too, which pip does not install:
 #   playwright install chromium

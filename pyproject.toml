@@ -32,6 +32,7 @@ dependencies = [
     "playwright>=1.40",
     "playwright-stealth>=2.0",
     "pydantic>=2.0",
+    "python-multipart>=0.0.7",
     "tiktoken>=0.5",
     "uvicorn>=0.20",
 ]
