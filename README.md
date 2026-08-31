@@ -122,10 +122,36 @@ pip install -e .
 
 ### Docker 部署（可选）
 
+镜像里的 Chromium 跑在 Xvfb 虚拟显示上，是**有头**模式，扫码登录通过 noVNC 完成。
+
 ```bash
-docker build -t doubao2api .
-docker run -d -p 9090:9090 -v ./. doubao_session.json:/app/.doubao_session.json doubao2api
+git clone https://github.com/wangchuxiaoji-oss/doubao2api.git
+cd doubao2api
+cp .env.example .env
+# 至少填 DOUBAO_API_KEY 和 DOUBAO_NOVNC_PASSWORD
+docker compose up -d --build
 ```
+
+首次构建要下载 Chromium 和一批 X 依赖，比较慢。
+
+登录一次即可，登录态存在 `./data/browser`，重启和 rebuild 都不丢：
+
+```bash
+# 在本地（有浏览器的那台机器）开隧道，不是在服务器上执行
+ssh -L 6080:localhost:6080 user@server
+```
+
+然后浏览器打开 `http://localhost:6080/vnc.html`，输入 `DOUBAO_NOVNC_PASSWORD`，扫码。
+
+compose 里 noVNC 只绑在 `127.0.0.1:6080`，因为拿到那个端口就等于拿到已登录的浏览器，而 noVNC 走的是明文 HTTP。要暴露到公网就自行加 TLS 和来源白名单。
+
+几个不能省的配置，都已写在 `docker-compose.yml` 里：
+
+| 配置 | 原因 |
+|------|------|
+| `shm_size: 2gb` | 默认 64MB 的 `/dev/shm` 会让有头 Chromium 中途崩成 "Target closed" |
+| `hostname: doubao2api` | Chromium 把主机名写进 profile 的 `SingletonLock`，容器名随机变化会导致重建后打不开 profile |
+| `DOUBAO_HOST=0.0.0.0` | 覆盖 `.env` 里的 `127.0.0.1` 默认值，否则映射出去的端口无人应答 |
 
 ### 前置条件
 
@@ -1035,6 +1061,8 @@ python -m doubao2api
 
 #### 生产部署（Ubuntu）
 
+> 用 Docker 部署见 [Docker 部署（可选）](#docker-部署可选)。下面这套裸机方式默认无头运行，需要自备已登录的 `DOUBAO_BROWSER_DATA` 目录，或另行准备图形环境完成扫码。
+
 ```bash
 DOUBAO_API_KEY=your-secret-key \
 DOUBAO_HOST=0.0.0.0 \
@@ -1101,9 +1129,10 @@ server {
 | `DOUBAO_API_KEY` | (空=无认证) | Bearer token。设为 `any` 接受任意非空 key |
 | `DOUBAO_RPM_LIMIT` | `20` | 每分钟请求限制（所有端点共享） |
 | `DOUBAO_HEADLESS` | `true` | Chromium 是否无头运行 |
-| `DOUBAO_BROWSER_DATA` | `~/.doubao_browser` | Chromium 持久化用户目录 |
+| `DOUBAO_BROWSER_DATA` | `~/.doubao_browser` | Chromium 持久化用户目录（Docker 镜像内为 `/data/browser`） |
+| `DOUBAO_ACCOUNTS_FILE` | `.doubao_accounts.json` | 账号名单（Docker 镜像内为 `/data/accounts.json`） |
 | `DOUBAO_NOVNC_URL` | 自动推断 | Admin 面板中的 noVNC 地址 |
-| `DOUBAO_NOVNC_PASSWORD` | 空 | 自动拼接到 noVNC URL 的密码参数 |
+| `DOUBAO_NOVNC_PASSWORD` | 空 | noVNC 密码。Docker 有头模式下同时用于 VNC 认证，留空则不设密码 |
 
 ### 认证
 
