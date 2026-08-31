@@ -3,6 +3,10 @@ services:
     build: .
     image: doubao2api
     container_name: doubao2api
+    # Chromium writes the hostname into the profile's SingletonLock. Letting
+    # Docker generate a new one per container makes every rebuild look like a
+    # different machine holding the profile, which Chromium refuses to open.
+    hostname: doubao2api
     restart: unless-stopped
     # Chromium in headed mode crashes on the default 64MB /dev/shm.
     shm_size: 2gb

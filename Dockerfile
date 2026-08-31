@@ -19,7 +19,7 @@ RUN pip install -r requirements.txt \
     && rm -rf /var/lib/apt/lists/*
 
 COPY docker/ /docker/
-RUN chmod +x /docker/x11vnc.sh
+RUN chmod +x /docker/*.sh
 
 COPY doubao2api/ doubao2api/
 
