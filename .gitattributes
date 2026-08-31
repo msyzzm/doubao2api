@@ -1,0 +1,5 @@
+# These are copied into a Linux container. CRLF would make the shell script
+# fail with "bad interpreter" and confuse supervisord's config parser.
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+docker/** text eol=lf

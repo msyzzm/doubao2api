@@ -1,0 +1,22 @@
+services:
+  doubao2api:
+    build: .
+    image: doubao2api
+    container_name: doubao2api
+    restart: unless-stopped
+    # Chromium in headed mode crashes on the default 64MB /dev/shm.
+    shm_size: 2gb
+    env_file:
+      - .env
+    environment:
+      DOUBAO_HEADLESS: "false"
+      # Overrides the .env default, which is loopback-only and would make the
+      # published port unreachable from outside the container.
+      DOUBAO_HOST: "0.0.0.0"
+    ports:
+      - "9090:9090"
+      # noVNC stays on loopback. Reach it with an SSH tunnel:
+      #   ssh -L 6080:localhost:6080 user@server
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - ./data:/data

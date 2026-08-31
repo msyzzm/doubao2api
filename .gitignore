@@ -37,3 +37,6 @@ Thumbs.db
 
 # Account roster (passport ids)
 .doubao_accounts.json
+
+# Docker volume: browser profile + account roster
+data/
