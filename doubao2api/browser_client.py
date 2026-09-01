@@ -20,7 +20,7 @@ import struct
 import time
 import uuid
 from urllib.parse import urlencode
-from typing import AsyncGenerator, Optional, Dict, Any, List
+from typing import AsyncGenerator, Optional, Dict, Any, List, Tuple, Union
 from urllib.parse import urlencode
 
 import httpx
@@ -612,6 +612,7 @@ class BrowserClient:
         use_deep_think: int = 0,
         chat_ability: Optional[Dict[str, Any]] = None,
         leading_blocks: Optional[List[Dict[str, Any]]] = None,
+        leading_message_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch.
 
@@ -621,6 +622,8 @@ class BrowserClient:
 
         leading_blocks are sent as their own message ahead of the text one; the
         web client attaches images that way rather than mixing blocks.
+        leading_message_id is the local_message_id that message must carry —
+        the one the attachments were registered under.
         """
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
@@ -725,7 +728,7 @@ class BrowserClient:
         if leading_blocks:
             # Attachments travel as their own message, ahead of the text one.
             payload["messages"].insert(0, {
-                "local_message_id": str(uuid.uuid1()),
+                "local_message_id": leading_message_id or str(uuid.uuid1()),
                 "content_block": leading_blocks,
                 "message_status": 0,
             })
@@ -1546,7 +1549,7 @@ class BrowserClient:
         ratio: Optional[str] = None,
         duration: int = 10,
         model: Optional[str] = None,
-        ref_image: Optional[Dict[str, Any]] = None,
+        ref_image: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         timeout: float = 480,
         poll_interval: float = 10,
     ) -> Dict[str, Any]:
@@ -1564,7 +1567,10 @@ class BrowserClient:
             model: Doubao's internal video model id; defaults to VIDEO_MODEL.
                 Only "seedance_v2.0" has been observed in the web client.
             ref_image: Reference image for image-to-video, as returned by
-                upload_image(): {"uri": ..., "name": ..., "width": ..., "height": ...}.
+                upload_ref_image(): {"uri": ..., "name": ..., "identifier": ...,
+                "width": ..., "height": ...}. Pass the list from
+                upload_ref_images() to reference several images at once; the
+                prompt then refers to them as 参考图1, 图2 and so on.
             timeout: Give up after this many seconds.
             poll_interval: Seconds between history polls.
 
@@ -1587,10 +1593,15 @@ class BrowserClient:
         # The web client sends the formatted text, not the raw prompt.
         display_text = f"生成视频：{prompt}，{duration}s"
 
-        # With a reference image the web client sends only the attachment block;
-        # the prompt travels in chat_ability instead of a text block.
+        refs = [ref_image] if isinstance(ref_image, dict) else list(ref_image or [])
+
+        # With reference images the web client sends only the attachment block;
+        # the prompt travels in chat_ability instead of a text block. Several
+        # images ride in one block, in the order the prompt refers to them.
         leading_blocks = None
-        if ref_image:
+        leading_message_id = None
+        if refs:
+            leading_message_id = refs[0].get("local_message_id")
             leading_blocks = [{
                 "block_type": ATTACHMENT_BLOCK_TYPE,
                 "content": {
@@ -1599,14 +1610,14 @@ class BrowserClient:
                             "type": ATTACHMENT_TYPE_IMAGE,
                             # Must match the identifier registered via
                             # pre_handle_v2_without_conv.
-                            "identifier": ref_image.get("identifier") or str(uuid.uuid1()),
+                            "identifier": ref.get("identifier") or str(uuid.uuid1()),
                             "image": {
-                                "name": ref_image.get("name") or "image.png",
-                                "uri": ref_image["uri"],
+                                "name": ref.get("name") or "image.png",
+                                "uri": ref["uri"],
                                 "image_ori": {
                                     "url": "",
-                                    "width": int(ref_image.get("width") or 0),
-                                    "height": int(ref_image.get("height") or 0),
+                                    "width": int(ref.get("width") or 0),
+                                    "height": int(ref.get("height") or 0),
                                     "format": "",
                                     "url_formats": {},
                                 },
@@ -1616,7 +1627,7 @@ class BrowserClient:
                             "upload_status": 1,
                             "progress": 100,
                             "src": "",
-                        }],
+                        } for ref in refs],
                     },
                     "pc_event_block": "",
                 },
@@ -1626,14 +1637,15 @@ class BrowserClient:
                 "append_fields": [],
             }]
 
-        log.info("generate_video: prompt=%s, ratio=%s, duration=%s, model=%s, ref_image=%s",
+        log.info("generate_video: prompt=%s, ratio=%s, duration=%s, model=%s, ref_images=%d",
                  prompt[:50], ratio, duration, ability_param["model"],
-                 bool(ref_image))
+                 len(refs))
 
         conversation_id = None
         text_parts = []
         async for event in self.chat_completion(
-            display_text, chat_ability=chat_ability, leading_blocks=leading_blocks
+            display_text, chat_ability=chat_ability, leading_blocks=leading_blocks,
+            leading_message_id=leading_message_id
         ):
             if event.get("error"):
                 raise RuntimeError(
@@ -1932,6 +1944,8 @@ class BrowserClient:
         image_data: bytes,
         filename: str,
         bot_id: Optional[str] = None,
+        local_message_id: Optional[str] = None,
+        pre_generate_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Upload an image and register it for use as a message attachment.
 
@@ -1940,38 +1954,94 @@ class BrowserClient:
         there must be reused in the attachment block, otherwise the server
         rejects the message.
 
+        Images destined for the same message are registered as a group: they
+        share one local_message_id, and every registration after the first
+        echoes the pre_generate_id the first one returned. upload_ref_images()
+        does that chaining; pass the two ids here to extend a group by hand.
+
         Returns a dict ready to pass to generate_video(ref_image=...).
         """
         uploaded = await self.upload_file(
             image_data, filename, resource_type=IMAGE_RESOURCE_TYPE
         )
         identifier = str(uuid.uuid1())
-        await self._alice_request(
-            "/alice/message/pre_handle_v2_without_conv",
-            {
-                "uplink_entity": {
-                    "entity_type": 2,
-                    "entity_content": {"image": {"key": uploaded["uri"]}},
-                    "identifier": identifier,
-                },
-                "bot_id": bot_id or DEFAULT_BOT_ID,
-                "local_message_id": str(uuid.uuid1()),
+        local_message_id = local_message_id or str(uuid.uuid1())
+        request_body = {
+            "uplink_entity": {
+                "entity_type": 2,
+                "entity_content": {"image": {"key": uploaded["uri"]}},
+                "identifier": identifier,
             },
+            "bot_id": bot_id or DEFAULT_BOT_ID,
+            "local_message_id": local_message_id,
+        }
+        if pre_generate_id:
+            request_body["pre_generate_id"] = pre_generate_id
+        response = await self._alice_request(
+            "/alice/message/pre_handle_v2_without_conv", request_body
         )
-        width, height = self._png_size(image_data)
+        width, height = self._image_size(image_data)
         return {
             "uri": uploaded["uri"],
             "name": uploaded["name"],
             "identifier": identifier,
             "width": width,
             "height": height,
+            "local_message_id": local_message_id,
+            "pre_generate_id": (
+                response.get("data", {}).get("pre_generate_id")
+                or pre_generate_id or ""
+            ),
         }
 
+    async def upload_ref_images(
+        self,
+        images: List[Tuple[bytes, str]],
+        bot_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Register several images as the reference set of one message.
+
+        Sequential rather than concurrent: every registration but the first
+        needs the pre_generate_id the previous one returned, and that chain is
+        what binds the images into a single attachment group.
+        """
+        refs: List[Dict[str, Any]] = []
+        local_message_id = str(uuid.uuid1())
+        pre_generate_id = ""
+        for data, filename in images:
+            ref = await self.upload_ref_image(
+                data, filename, bot_id=bot_id,
+                local_message_id=local_message_id,
+                pre_generate_id=pre_generate_id,
+            )
+            pre_generate_id = ref["pre_generate_id"] or pre_generate_id
+            refs.append(ref)
+        return refs
+
     @staticmethod
-    def _png_size(data: bytes) -> tuple:
-        """Read (width, height) from a PNG header; (0, 0) for anything else."""
+    def _image_size(data: bytes) -> tuple:
+        """Read (width, height) from a PNG or JPEG header; (0, 0) otherwise.
+
+        The web client puts the real dimensions in every attachment, and
+        reference images are usually JPEG, so guessing (0, 0) for them would
+        make our attachment block the odd one out in a multi-image set.
+        """
         if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
             return struct.unpack(">II", data[16:24])
+        if data[:2] == b"\xff\xd8":
+            # Walk the marker segments to the frame header, which is the only
+            # place JPEG records its size.
+            pos = 2
+            while pos + 9 < len(data):
+                if data[pos] != 0xFF:
+                    break
+                marker = data[pos + 1]
+                # SOF0..SOF15, minus the DHT/JPG/DAC markers interleaved in
+                # that range, all start with the same height/width fields.
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
+                    return (width, height)
+                pos += 2 + struct.unpack(">H", data[pos + 2:pos + 4])[0]
         return (0, 0)
 
     async def _alice_request(

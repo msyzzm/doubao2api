@@ -1087,32 +1087,46 @@ def create_app(
 
     @app.post("/v1/video/ref_image")
     async def upload_video_ref_image(request: Request):
-        """Upload an image for image-to-video and register it with Doubao."""
+        """Upload one or more images for image-to-video and register them.
+
+        Images sent together are registered as one group, which is what lets a
+        single generation reference them all; uploading them one call at a time
+        registers them separately instead. One file answers with the object it
+        always did, several with the list to pass back as ref_image.
+        """
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
         form = await request.form()
-        upload = form.get("file") or form.get("image")
-        if not upload:
+        uploads = [v for _, v in form.multi_items() if hasattr(v, "read")]
+        if not uploads:
             raise HTTPException(status_code=400, detail="Missing file field")
-        data = await upload.read()
+        images = [(await u.read(), u.filename or "image.png") for u in uploads]
         try:
-            result = await client.upload_ref_image(data, upload.filename or "image.png")
+            refs = await client.upload_ref_images(images)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
-        return JSONResponse(result)
+        return JSONResponse(refs[0] if len(refs) == 1 else refs)
 
-    def _video_ref_image(body: dict) -> Optional[dict]:
-        """Build the image-to-video reference from the request body.
+    def _video_ref_images(body: dict) -> List[dict]:
+        """Build the image-to-video reference list from the request body.
 
-        Accepts either a full object under "ref_image" or the bare TOS uri in
-        "ref_image_key" (the key returned by /v1/images/upload).
+        Accepts one object or a list of them under "ref_image", or the bare TOS
+        uri(s) in "ref_image_key" (the key returned by /v1/images/upload).
         """
-        ref = body.get("ref_image")
-        if isinstance(ref, dict) and ref.get("uri"):
-            return ref
-        key = body.get("ref_image_key")
-        return {"uri": key} if key else None
+        refs = body.get("ref_image")
+        if isinstance(refs, dict):
+            refs = [refs]
+        if isinstance(refs, list):
+            usable = [r for r in refs if isinstance(r, dict) and r.get("uri")]
+            if usable:
+                return usable
+        keys = body.get("ref_image_key")
+        if isinstance(keys, str):
+            keys = [keys]
+        if isinstance(keys, list):
+            return [{"uri": key} for key in keys if key]
+        return []
 
     async def _generate_video_failover(
         client: BrowserClient, kwargs: dict
@@ -1225,7 +1239,7 @@ def create_app(
             prompt=prompt, ratio=ratio,
             duration=int(body.get("duration") or 10),
             model=_video_model(body),
-            ref_image=_video_ref_image(body),
+            ref_image=_video_ref_images(body),
         )
         try:
             result = await _generate_video_failover(client, kwargs)
@@ -1257,17 +1271,18 @@ def create_app(
         """Read a create-job request, which arrives as JSON or as multipart.
 
         The OpenAI SDK posts multipart whenever input_reference carries a file
-        and JSON otherwise, so both have to be accepted. Any uploaded part is
-        taken as the reference image whatever its field name: callers spell it
+        and JSON otherwise, so both have to be accepted. Every uploaded part is
+        taken as a reference image whatever its field name: callers spell it
         input_reference, image and file about equally often, and ignoring the
         wrong spelling would start a text-to-video whose prompt talks about a
         picture the model never received.
         """
         if request.headers.get("content-type", "").startswith("multipart/form-data"):
             form = await request.form()
-            upload = next((v for v in form.values() if hasattr(v, "read")), None)
-            return {k: v for k, v in form.items() if not hasattr(v, "read")}, upload
-        return await request.json(), None
+            uploads = [v for _, v in form.multi_items() if hasattr(v, "read")]
+            fields = {k: v for k, v in form.multi_items() if not hasattr(v, "read")}
+            return fields, uploads
+        return await request.json(), []
 
     async def _fetch_ref_image(url: str):
         """Download a reference image given by URL, as (bytes, filename).
@@ -1315,22 +1330,26 @@ def create_app(
             )
         return resp.content, url.split("?")[0].rsplit("/", 1)[-1] or "ref.png"
 
-    async def _video_job_ref(client: BrowserClient, body: dict, upload):
-        """Resolve the reference image into a Doubao ref_image, or None.
+    async def _video_job_refs(
+        client: BrowserClient, body: dict, uploads: list
+    ) -> List[dict]:
+        """Resolve the request's reference images into Doubao ref_images.
 
         Handles every form OpenAI's input_reference takes, plus this server's
-        own ref_image object. Rejects rather than returning None once the
-        caller has clearly tried to send a reference: dropping it silently
-        costs eight minutes and a generation before the failure surfaces.
+        own ref_image object, and accepts a list of any of them for a
+        multi-reference generation. Rejects rather than returning an empty list
+        once the caller has clearly tried to send a reference: dropping it
+        silently costs eight minutes and a generation before the failure
+        surfaces.
         """
-        if upload is not None:
-            data = await upload.read()
-            return await client.upload_ref_image(data, upload.filename or "ref.png")
+        if uploads:
+            images = [(await u.read(), u.filename or "ref.png") for u in uploads]
+            return await client.upload_ref_images(images)
 
-        # Multipart carries every non-file part as text, so an object arrives
-        # here as a JSON string rather than as a dict.
+        # Multipart carries every non-file part as text, so an object or list
+        # arrives here as a JSON string rather than as a dict or list.
         ref = body.get("input_reference")
-        if isinstance(ref, str) and ref.lstrip().startswith("{"):
+        if isinstance(ref, str) and ref.lstrip()[:1] in ("{", "["):
             try:
                 ref = json.loads(ref)
             except json.JSONDecodeError:
@@ -1338,26 +1357,29 @@ def create_app(
                     status_code=400, detail="input_reference is not valid JSON"
                 )
 
-        if isinstance(ref, dict) and ref.get("file_id"):
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference.file_id is not supported: /v1/files "
-                       "writes to Doubao's document bucket, which the video "
-                       "ability rejects. Upload through POST /v1/video/ref_image "
-                       "and pass its result as ref_image instead.",
-            )
-
-        url = ref if isinstance(ref, str) else ""
-        if isinstance(ref, dict):
-            url = ref.get("image_url") or ""
-            if isinstance(url, dict):  # OpenAI also nests it as {"url": ...}
-                url = url.get("url") or ""
-        if url:
-            data, name = await _fetch_ref_image(url)
-            return await client.upload_ref_image(data, name)
+        urls = []
+        for item in (ref if isinstance(ref, list) else [ref] if ref else []):
+            if isinstance(item, dict) and item.get("file_id"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="input_reference.file_id is not supported: /v1/files "
+                           "writes to Doubao's document bucket, which the video "
+                           "ability rejects. Upload through POST /v1/video/ref_image "
+                           "and pass its result as ref_image instead.",
+                )
+            url = item if isinstance(item, str) else ""
+            if isinstance(item, dict):
+                url = item.get("image_url") or ""
+                if isinstance(url, dict):  # OpenAI also nests it as {"url": ...}
+                    url = url.get("url") or ""
+            if url:
+                urls.append(url)
+        if urls:
+            images = [await _fetch_ref_image(url) for url in urls]
+            return await client.upload_ref_images(images)
 
         native_ref = body.get("ref_image")
-        if isinstance(native_ref, str) and native_ref.lstrip().startswith("{"):
+        if isinstance(native_ref, str) and native_ref.lstrip()[:1] in ("{", "["):
             try:
                 body = {**body, "ref_image": json.loads(native_ref)}
             except json.JSONDecodeError:
@@ -1365,7 +1387,7 @@ def create_app(
                     status_code=400, detail="ref_image is not valid JSON"
                 )
 
-        native = _video_ref_image(body)
+        native = _video_ref_images(body)
         if native:
             return native
 
@@ -1377,7 +1399,7 @@ def create_app(
                        "input_reference.image_url, or as the whole object "
                        "returned by POST /v1/video/ref_image.",
             )
-        return None
+        return []
 
     async def _run_video_job(job, kwargs: dict) -> None:
         """Run one generation to completion and fold the outcome into the job."""
@@ -1431,7 +1453,7 @@ def create_app(
         """Create a video job and return it immediately, still queued."""
         _check_auth(request)
         client = _get_client()
-        body, upload = await _video_job_body(request)
+        body, uploads = await _video_job_body(request)
 
         prompt = body.get("prompt", "")
         if not prompt:
@@ -1446,10 +1468,10 @@ def create_app(
                 status_code=400, detail=f"Invalid seconds: {seconds!r}"
             )
 
-        # Uploading the reference here rather than inside the job means a bad
+        # Uploading the references here rather than inside the job means a bad
         # image fails the create call outright instead of a minute later.
         try:
-            ref_image = await _video_job_ref(client, body, upload)
+            ref_images = await _video_job_refs(client, body, uploads)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -1458,7 +1480,7 @@ def create_app(
             ratio=_size_to_ratio(size),
             duration=duration,
             model=_video_model(body),
-            ref_image=ref_image,
+            ref_image=ref_images,
         )
         # Echo the model that will actually run, not the one that was asked
         # for: an OpenAI client sends "sora-2", which resolves to the default.

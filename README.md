@@ -476,7 +476,8 @@ for v in result["videos"]:
 data = open("ref.png", "rb").read()
 ref = await client.upload_ref_image(data, "ref.png")
 # ref: {"uri": "tos-cn-i-a9rns2rl98/xxx.png", "name": "ref.png",
-#       "identifier": "...", "width": 940, "height": 1674}
+#       "identifier": "...", "width": 940, "height": 1674,
+#       "local_message_id": "...", "pre_generate_id": "..."}
 
 result = await client.generate_video(
     prompt="角色原地待机动画，不要添加新的元素，固定镜头",
@@ -484,6 +485,27 @@ result = await client.generate_video(
     duration=4,
 )
 ```
+
+#### 多参考图
+
+多张参考图必须**一次性注册成一组**：它们共用一个 `local_message_id`，且第二张起要回传上一张返回的
+`pre_generate_id`，附件块里再按顺序排成一个 `attachments` 数组。分多次调用 `upload_ref_image()`
+会注册成互不相干的几组。`upload_ref_images()` 负责这个串联：
+
+```python
+refs = await client.upload_ref_images([
+    (open("room.jpg", "rb").read(), "room.jpg"),
+    (open("cat.jpg", "rb").read(), "cat.jpg"),
+])
+
+result = await client.generate_video(
+    prompt="参考图1 的房间里放上图2的角色，镜头固定",
+    ref_image=refs,      # 列表；顺序即 prompt 里的 图1、图2
+    duration=4,
+)
+```
+
+> prompt 用「参考图1」「图2」指代，顺序与列表一致。
 
 > 参考图必须落在**图片**存储桶（`prepare_upload` 的 `resource_type=2`，
 > 对应 `tos-cn-i-a9rns2rl98/`）。`upload_file()` 默认的 `resource_type=1`
@@ -497,7 +519,7 @@ result = await client.generate_video(
 | `ratio` | str | `"auto"` | 宽高比：`"1:1"`, `"16:9"`, `"9:16"` |
 | `duration` | int | `10` | 时长（秒） |
 | `model` | str | `"seedance_v2.0"` | 豆包内部模型 id，见下表 |
-| `ref_image` | dict | `None` | `upload_ref_image()` 的返回值（img2video） |
+| `ref_image` | dict \| list | `None` | `upload_ref_image()` 的返回值（img2video）；传 `upload_ref_images()` 的列表即多参考图 |
 | `timeout` | float | `480` | 最长等待秒数 |
 | `poll_interval` | float | `10` | 轮询间隔秒数 |
 
@@ -1672,7 +1694,7 @@ curl http://localhost:9090/v1/images/generations \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `file` | file | 是 | 图片文件（png/jpg/webp） |
+| `file` | file | 是 | 图片文件（png/jpg/webp）。可重复出现，多张图即多参考图 |
 
 ```bash
 curl -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png"
@@ -1685,12 +1707,23 @@ curl -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png"
   "name": "ref.png",
   "identifier": "105c7e6a-a45f-11f1-b67f-001a7dda7111",
   "width": 940,
-  "height": 1674
+  "height": 1674,
+  "local_message_id": "105bd728-a45f-11f1-b67f-001a7dda7111",
+  "pre_generate_id": "54073213015227650"
 }
 ```
 
+**多参考图**：一次请求带多个 `file`，返回值变成数组，整个数组作为 `ref_image` 传给生成端点。
+必须在同一次请求里上传：这些图会被注册成一组（共用 `local_message_id` 和 `pre_generate_id`），
+分多次调用注册出的是互不相干的几组。
+
+```bash
+curl -X POST http://localhost:9090/v1/video/ref_image \
+  -F "file=@room.jpg" -F "file=@cat.jpg"
+```
+
 > 不要用 `/v1/images/upload`：它落在另一个存储桶（`ocean-cloud-tos`），
-> 视频能力不接受，且不会执行注册步骤。宽高目前只能从 PNG 头解析，
+> 视频能力不接受，且不会执行注册步骤。宽高从 PNG / JPEG 头解析，
 > 其他格式返回 `0`。
 
 ---
@@ -1717,8 +1750,8 @@ curl -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png"
 | `video_model` | string | 否 | 同上，优先级高于 `model`。为兼容旧调用方保留 |
 | `ratio` | string | 否 | `1:1`/`16:9`/`9:16`，也可传 OpenAI 风格 `size` 后自动映射 |
 | `duration` | int | 否 | 时长秒数，默认 `10` |
-| `ref_image` | object | 否 | `/v1/video/ref_image` 的完整返回值（图生视频） |
-| `ref_image_key` | string | 否 | 只传 uri 的简写形式；缺少 `identifier`，**可能被豆包拒绝** |
+| `ref_image` | object \| array | 否 | `/v1/video/ref_image` 的完整返回值（图生视频）。传数组即多参考图 |
+| `ref_image_key` | string \| array | 否 | 只传 uri 的简写形式；缺少 `identifier`，**可能被豆包拒绝** |
 
 **图生视频示例**：
 ```bash
@@ -1726,6 +1759,15 @@ REF=$(curl -s -X POST http://localhost:9090/v1/video/ref_image -F "file=@ref.png
 curl -X POST http://localhost:9090/v1/video/generations \
   -H "Content-Type: application/json" \
   -d "{\"prompt\":\"角色原地待机动画，固定镜头\",\"duration\":4,\"ref_image\":$REF}"
+```
+
+**多参考图示例**（`REFS` 是数组，prompt 用「参考图1」「图2」指代，顺序与上传一致）：
+```bash
+REFS=$(curl -s -X POST http://localhost:9090/v1/video/ref_image \
+  -F "file=@room.jpg" -F "file=@cat.jpg")
+curl -X POST http://localhost:9090/v1/video/generations \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\":\"参考图1 的房间里放上图2的角色，镜头固定\",\"duration\":4,\"ref_image\":$REFS}"
 ```
 
 **响应**：
@@ -1829,8 +1871,8 @@ OpenAI Videos API（Sora）兼容端点。和 `/v1/video/generations` 走同一�
 | `size` | string | 否 | `宽x高`，默认 `720x1280`。仅用于换算宽高比 |
 | `model` | string | 否 | `seedance_v2.0`（默认）/ `seedance_v2.0_mini`。OpenAI 客户端传的 `sora-2` 会回退到默认 |
 | `video_model` | string | 否 | 同上，优先级高于 `model` |
-| `input_reference` | file / object | 否 | 图生视频的参考图，见下 |
-| `ref_image` | object | 否 | **扩展字段**。`/v1/video/ref_image` 的完整返回值 |
+| `input_reference` | file / object / array | 否 | 图生视频的参考图，见下 |
+| `ref_image` | object / array | 否 | **扩展字段**。`/v1/video/ref_image` 的完整返回值 |
 
 作业对象里回显的 `model` 是**实际运行**的模型，不是请求里写的——传 `sora-2` 会得到
 `"model": "seedance_v2.0"`。
@@ -1849,6 +1891,34 @@ curl -X POST http://localhost:9090/v1/videos \
 | multipart 文件 | OpenAI SDK 的默认方式。字段名**不限**——任何文件部分都会被当作参考图 |
 | `input_reference.image_url` | http(s) URL 或 `data:` URI，服务端下载后转存。也接受 `{"url": ...}` 嵌套写法与裸字符串 |
 | `ref_image` | 扩展字段，`/v1/video/ref_image` 的完整返回值 |
+
+三种形式都可以给多张：multipart 带多个文件部分，`input_reference` 传数组（元素为 URL 或
+`{"image_url": ...}`），`ref_image` 传数组。服务端会把它们注册成一组，prompt 里用
+「参考图1」「图2」按顺序指代。
+
+**多参考图（OpenAI SDK 原生写法）**：`input_reference` 直接传文件列表，不需要本服务的扩展字段。
+SDK 会把列表编码成重复的 `input_reference[]` 文件部分，服务端全部收下。
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:9090/v1", api_key=DOUBAO_API_KEY)
+
+job = client.videos.create(
+    model="seedance_v2.0",
+    prompt="参考图1 的房间里放上图2的角色，镜头固定",
+    seconds="4",
+    size="1280x720",
+    input_reference=[open("room.jpg", "rb"), open("cat.jpg", "rb")],
+)
+while job.status in ("queued", "in_progress"):
+    time.sleep(20)
+    job = client.videos.retrieve(job.id)
+client.videos.download_content(job.id).write_to_file("out.mp4")
+```
+
+> 不要用 `extra_body` 传 `ref_image` 数组：`videos.create` 一律走 multipart，SDK 会把嵌套对象
+> 拍平成 `ref_image[][uri]` 这样的表单字段，服务端认不出来。要么用 `input_reference` 列表，
+> 要么绕开 SDK 直接发 JSON。
 
 `input_reference.file_id` **不支持**：`/v1/files` 写入豆包的文档桶
 （`resource_type=1`），视频能力只接受图片桶（`resource_type=2`），两者不通。
