@@ -19,12 +19,11 @@ import os
 import struct
 import time
 import uuid
-from urllib.parse import urlencode
-from typing import AsyncGenerator, Optional, Dict, Any, List, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
 import httpx
-from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
 from .unwatermark import resolve_unwatermarked
@@ -1776,11 +1775,12 @@ class BrowserClient:
         Returns:
             Dict with uri, name, size, file_type.
         """
-        import zlib
         import hashlib
         import hmac as hmac_mod
+        import zlib
         from datetime import datetime, timezone
-        from urllib.parse import urlparse, parse_qs, quote as url_quote
+        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import quote as url_quote
 
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")

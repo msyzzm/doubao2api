@@ -6,7 +6,6 @@ Applies a 1.3x safety factor since Doubao uses a different tokenizer
 (likely overestimates by 10-30%, which is safer for context management).
 """
 import logging
-from typing import Optional
 
 log = logging.getLogger(__name__)
 

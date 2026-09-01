@@ -18,11 +18,10 @@ No login required for basic usage (temporary sessions).
 import asyncio
 import json
 import logging
-import time
 import uuid
-from typing import AsyncGenerator, Optional, Dict, Any
+from typing import Any, AsyncGenerator, Dict, Optional
 
-from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
 log = logging.getLogger(__name__)

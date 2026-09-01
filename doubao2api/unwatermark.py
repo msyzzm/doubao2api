@@ -82,7 +82,9 @@ def _decrypt_main_url(token: str, key_seed: str) -> str:
     """Decrypt an AES-CBC main_url token; '' when it cannot be recovered."""
     try:
         from cryptography.hazmat.primitives.ciphers import (
-            Cipher, algorithms, modes,
+            Cipher,
+            algorithms,
+            modes,
         )
     except ImportError:
         log.warning("unwatermark: cryptography not installed, "

@@ -29,25 +29,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .accounts import AccountPool, FREE_DAILY_QUOTA
-from .browser_client import BrowserClient, QuotaExhaustedError, VIDEO_MODEL
-from .qianwen_client import QianwenClient, QIANWEN_MODELS
+from .accounts import FREE_DAILY_QUOTA, AccountPool
+from .browser_client import VIDEO_MODEL, BrowserClient, QuotaExhaustedError
+from .qianwen_client import QIANWEN_MODELS, QianwenClient
+from .token_counter import SAFETY_FACTOR, count_messages_tokens, count_tokens
 from .tool_calling import (
-    build_tool_system_prompt,
-    convert_messages_with_tools,
-    parse_tool_calls_xml,
-    is_tool_call_start,
-    has_complete_tool_calls,
-    StreamingGuard,
-    detect_truncated_tool_call,
-    build_continuation_prompt,
-    filter_history_by_topic,
     ToolNameObfuscator,
+    build_continuation_prompt,
     coerce_tool_arguments,
+    convert_messages_with_tools,
     deduplicate_continuation,
+    detect_truncated_tool_call,
+    filter_history_by_topic,
+    has_complete_tool_calls,
+    is_tool_call_start,
+    parse_tool_calls_xml,
 )
-from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
-from .video_jobs import VideoJobStore, COMPLETED
+from .video_jobs import COMPLETED, VideoJobStore
 
 log = logging.getLogger("doubao_unified")
 
@@ -784,7 +782,7 @@ def create_app(
                 parsed = parse_tool_calls_xml(source)
                 if not parsed and content:
                     parsed = parse_tool_calls_xml(content)
-                
+
                 # Auto-continue if tool call was truncated
                 if not parsed and detect_truncated_tool_call(source or content):
                     log.info("Detected truncated tool_call, attempting continuation...")
@@ -801,7 +799,7 @@ def create_app(
                             log.info("Continuation successful, got %d tool calls", len(parsed))
                     except Exception as e:
                         log.warning("Continuation failed: %s", e)
-                
+
                 if parsed:
                     # Deobfuscate tool names back to original
                     parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
@@ -971,7 +969,7 @@ def create_app(
             # Also try main content if think didn't have it
             if not parsed and full_content:
                 parsed = parse_tool_calls_xml(full_content)
-            
+
             # Auto-continue if truncated
             if not parsed and detect_truncated_tool_call(source or full_content):
                 log.info("Stream: detected truncated tool_call, attempting continuation...")
@@ -987,7 +985,7 @@ def create_app(
                         log.info("Stream continuation got %d tool calls", len(parsed))
                 except Exception as e:
                     log.warning("Stream continuation failed: %s", e)
-            
+
             if parsed:
                 # Deobfuscate tool names back to original
                 parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
@@ -2451,7 +2449,7 @@ def run_server():
 
     app = create_app(api_key=api_key or None, rpm_limit=rpm)
 
-    print(f"\n  Doubao API Server (Playwright)")
+    print("\n  Doubao API Server (Playwright)")
     print(f"  Listening on http://{host}:{port}")
     print(f"  Admin page: http://{host}:{port}/admin")
     if novnc_url:
