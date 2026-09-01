@@ -1,7 +1,11 @@
 services:
   doubao2api:
+    # Both routes work off this one name: `docker compose up -d --build` builds
+    # locally and tags it, `docker compose pull` fetches what GitHub Actions
+    # pushed. Servers want the second — building the Chromium layers on a small
+    # box takes about fifteen minutes.
     build: .
-    image: doubao2api
+    image: ghcr.io/msyzzm/doubao2api:main
     container_name: doubao2api
     # Chromium writes the hostname into the profile's SingletonLock. Letting
     # Docker generate a new one per container makes every rebuild look like a

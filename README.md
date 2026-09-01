@@ -129,10 +129,21 @@ git clone https://github.com/wangchuxiaoji-oss/doubao2api.git
 cd doubao2api
 cp .env.example .env
 # 至少填 DOUBAO_API_KEY 和 DOUBAO_NOVNC_PASSWORD
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
-首次构建要下载 Chromium 和一批 X 依赖，比较慢。
+镜像由 GitHub Actions（`.github/workflows/docker.yml`）在推 main 时构建并推到
+`ghcr.io/msyzzm/doubao2api:main`，服务器直接拉即可。想在本机构建就用
+`docker compose up -d --build` —— 首次要下载 Chromium 和一批 X 依赖，约十五分钟。
+
+**更新**：
+
+```bash
+git pull                                  # 只为拿到新的 compose/README
+docker compose pull && docker compose up -d
+```
+
+代码是烤进镜像的，不是挂载，所以必须换镜像；重启容器不生效。登录态在 `./data`，换镜像不丢。
 
 登录一次即可，登录态存在 `./data/browser`，重启和 rebuild 都不丢：
 
