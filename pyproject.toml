@@ -38,9 +38,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/wangchuxiaoji-oss/doubao2api"
-Repository = "https://github.com/wangchuxiaoji-oss/doubao2api"
-Issues = "https://github.com/wangchuxiaoji-oss/doubao2api/issues"
+Homepage = "https://github.com/msyzzm/doubao2api"
+Repository = "https://github.com/msyzzm/doubao2api"
+Issues = "https://github.com/msyzzm/doubao2api/issues"
 
 [project.scripts]
 doubao2api = "doubao2api.__main__:main"

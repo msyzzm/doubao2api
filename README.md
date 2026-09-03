@@ -2,11 +2,11 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Docker](https://img.shields.io/badge/docker-supported-blue?logo=docker)](https://github.com/wangchuxiaoji-oss/doubao2api#docker-%E9%83%A8%E7%BD%B2%E5%8F%AF%E9%80%89)
-[![GitHub Stars](https://img.shields.io/github/stars/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/issues)
-[![GitHub Last Commit](https://img.shields.io/github/last-commit/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/commits/main)
+[![Docker](https://img.shields.io/badge/docker-supported-blue?logo=docker)](https://github.com/msyzzm/doubao2api#docker-%E9%83%A8%E7%BD%B2%E5%8F%AF%E9%80%89)
+[![GitHub Stars](https://img.shields.io/github/stars/msyzzm/doubao2api?style=social)](https://github.com/msyzzm/doubao2api/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/msyzzm/doubao2api?style=social)](https://github.com/msyzzm/doubao2api/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/msyzzm/doubao2api)](https://github.com/msyzzm/doubao2api/issues)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/msyzzm/doubao2api)](https://github.com/msyzzm/doubao2api/commits/main)
 
 逆向豆包（Doubao）客户端 API，为 AI 智能体提供免费的多模态能力。通过 OpenAI 兼容接口，让任何纯文本模型也能识图、读文件、生成图片/音乐/视频。
 
@@ -112,10 +112,10 @@
 
 ```bash
 # 方式一：pip 安装（推荐）
-pip install git+https://github.com/wangchuxiaoji-oss/doubao2api.git
+pip install git+https://github.com/msyzzm/doubao2api.git
 
 # 方式二：从源码
-git clone https://github.com/wangchuxiaoji-oss/doubao2api.git
+git clone https://github.com/msyzzm/doubao2api.git
 cd doubao2api
 pip install -e .
 ```
@@ -125,7 +125,7 @@ pip install -e .
 镜像里的 Chromium 跑在 Xvfb 虚拟显示上，是**有头**模式，扫码登录通过 noVNC 完成。
 
 ```bash
-git clone https://github.com/wangchuxiaoji-oss/doubao2api.git
+git clone https://github.com/msyzzm/doubao2api.git
 cd doubao2api
 cp .env.example .env
 # 至少填 DOUBAO_API_KEY 和 DOUBAO_NOVNC_PASSWORD
@@ -2535,12 +2535,6 @@ doubao2api/
 └── static/
     └── admin.html       # Admin Dashboard（Vue 3）
 ```
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=wangchuxiaoji-oss/doubao2api&type=Date)](https://star-history.com/#wangchuxiaoji-oss/doubao2api&Date)
-
----
 
 ## Keywords / 关键词
 
